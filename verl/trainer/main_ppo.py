@@ -64,14 +64,22 @@ def run_ppo(config) -> None:
     # isolation, will solve in the future
     os.environ["ENSURE_CUDA_VISIBLE_DEVICES"] = os.environ.get('CUDA_VISIBLE_DEVICES', '')
     if not ray.is_initialized():
-        # this is for local ray cluster
-        ray.init(runtime_env={
+        # Local by default; set RAY_ADDRESS (e.g. from `ray start`) for multi-node.
+        runtime_env = {
             'env_vars': {
                 'TOKENIZERS_PARALLELISM': 'true',
                 'NCCL_DEBUG': 'WARN',
-                'VLLM_LOGGING_LEVEL': 'WARN'
+                'VLLM_LOGGING_LEVEL': 'WARN',
+                'VLLM_USE_V1': os.environ.get('VLLM_USE_V1', '0'),
+                'VLLM_WORKER_MULTIPROC_METHOD': os.environ.get('VLLM_WORKER_MULTIPROC_METHOD', 'spawn'),
+                'PYTHONNOUSERSITE': os.environ.get('PYTHONNOUSERSITE', '1'),
             }
-        })
+        }
+        ray_address = os.environ.get('RAY_ADDRESS')
+        if ray_address:
+            ray.init(address=ray_address, runtime_env=runtime_env)
+        else:
+            ray.init(runtime_env=runtime_env)
 
     runner = TaskRunner.remote()
     ray.get(runner.run.remote(config))

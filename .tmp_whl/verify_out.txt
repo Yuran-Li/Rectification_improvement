@@ -1,0 +1,18 @@
+BEGIN
+OK  numpy: 1.26.4
+OK  orjson: 3.11.9
+OK  torch: 2.6.0
+OK  transformers: 4.51.3
+OK  accelerate: 1.4.0
+OK  ray: 2.56.0
+OK  flash_attn: 2.5.7
+OK  tensordict: 0.6.2
+OK  wandb: 0.28.0
+OK  math_verify: OK
+OK  pyarrow: 25.0.0
+OK  pandas: 2.2.3
+OK  datasets: 5.0.0
+OK  hydra: 1.3.4
+OK  omegaconf: 2.3.1
+OK  peft: 0.19.1
+OK  codetiming: 1.4.0

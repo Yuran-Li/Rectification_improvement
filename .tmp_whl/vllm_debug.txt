@@ -1,0 +1,20 @@
+warm
+importing vllm...
+INFO 07-28 09:00:56 [__init__.py:243] No platform detected, vLLM is running on UnspecifiedPlatform
+Traceback (most recent call last):
+  File "<stdin>", line 4, in <module>
+  File "/scratch/yuranli/virtualenvs/PAG/lib/python3.10/site-packages/vllm/__init__.py", line 12, in <module>
+    from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
+  File "/scratch/yuranli/virtualenvs/PAG/lib/python3.10/site-packages/vllm/engine/arg_utils.py", line 27, in <module>
+    from vllm.reasoning import ReasoningParserManager
+  File "/scratch/yuranli/virtualenvs/PAG/lib/python3.10/site-packages/vllm/reasoning/__init__.py", line 3, in <module>
+    from .abs_reasoning_parsers import ReasoningParser, ReasoningParserManager
+  File "/scratch/yuranli/virtualenvs/PAG/lib/python3.10/site-packages/vllm/reasoning/abs_reasoning_parsers.py", line 9, in <module>
+    from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
+  File "/scratch/yuranli/virtualenvs/PAG/lib/python3.10/site-packages/vllm/entrypoints/openai/protocol.py", line 11, in <module>
+    from fastapi import UploadFile
+  File "/scratch/yuranli/virtualenvs/PAG/lib/python3.10/site-packages/fastapi/__init__.py", line 7, in <module>
+    from .applications import FastAPI as FastAPI
+  File "/scratch/yuranli/virtualenvs/PAG/lib/python3.10/site-packages/fastapi/applications.py", line 6, in <module>
+    from annotated_doc import Doc
+ModuleNotFoundError: No module named 'annotated_doc'
