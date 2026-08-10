@@ -207,10 +207,12 @@ class FSDPSFTTrainer(object):
         init_context = get_init_weight_context_manager(use_meta_tensor=not config.tie_word_embeddings,
                                                        mesh=self.device_mesh)
 
+        # Flash Attention 2 requires fp16/bf16; FSDP mixed precision also uses bf16 params.
+        load_dtype = torch.bfloat16
         with init_context():
             self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(local_model_path,
                                                                                config=config,
-                                                                               torch_dtype=torch.float32,
+                                                                               torch_dtype=load_dtype,
                                                                                attn_implementation='flash_attention_2',
                                                                                trust_remote_code=trust_remote_code)
 
@@ -471,6 +473,18 @@ class FSDPSFTTrainer(object):
         self.total_training_steps = total_training_steps
         print(f'Total training steps: {self.total_training_steps}')
 
+        eval_every = int(self.config.trainer.get('eval_every', 0) or 0)
+        eval_rows = None
+        if eval_every > 0:
+            from verl.trainer.sft_pag_eval import load_math500_subset, run_distributed_pag_eval
+            eval_path = self.config.trainer.get('eval_data_path', None)
+            if not eval_path:
+                raise ValueError('trainer.eval_every>0 requires trainer.eval_data_path (e.g. datasets/math500.parquet)')
+            eval_n = int(self.config.trainer.get('eval_n_problems', 32))
+            eval_rows = load_math500_subset(eval_path, n=eval_n, seed=int(self.config.trainer.seed))
+            if rank == 0:
+                print(f'[SFT-eval] every {eval_every} steps on {len(eval_rows)} MATH problems from {eval_path}')
+
         # TODO (zhangchi.usc1992) add back checkpoint manager. Currently, it blocks when uploading to hdfs. So very slow.
 
         for epoch in range(self.config.trainer.total_epochs):
@@ -484,34 +498,26 @@ class FSDPSFTTrainer(object):
                 if rank == 0:
                     tracking.log(data=metric, step=global_step)
 
-                # for early exit validation
-                # if global_step >= self.total_training_steps:
-                #     # Perform final validation
-                #     val_losses = []
-                #     for val_data in self.val_dataloader:
-                #         val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
-                #         val_loss = self.validation_step(val_data)
-                #         val_losses.append(val_loss)
-                #     if rank == 0:
-                #         avg_val_loss = torch.mean(torch.stack(val_losses))
-                #         metric = {'val/loss': avg_val_loss.detach().item()}
-                #         tracking.log(data=metric, step=global_step)
-                #     torch.distributed.barrier()
+                if eval_every > 0 and global_step % eval_every == 0:
+                    torch.cuda.empty_cache()
+                    eval_metrics = run_distributed_pag_eval(
+                        self.fsdp_model,
+                        self.tokenizer,
+                        eval_rows,
+                        max_new_tokens=int(self.config.trainer.get('eval_max_new_tokens', 1024)),
+                        temperature=float(self.config.trainer.get('eval_temperature', 0.0)),
+                    )
+                    if rank == 0:
+                        print(f'[SFT-eval] step={global_step} ' +
+                              ' '.join(f'{k.split("/")[-1]}={v:.4f}' for k, v in eval_metrics.items()
+                                       if k.split('/')[-1] in
+                                       ('TPR', 'TNR', 'ECR_TP', 'EIR_FP', 'verify_acc', 'a1_acc',
+                                        'final_acc', 'i_to_c_rate', 'c_to_i_rate')))
+                        tracking.log(data=eval_metrics, step=global_step)
+                    self.fsdp_model.train()
+                    torch.distributed.barrier()
+                    torch.cuda.empty_cache()
 
-                #     # Save final checkpoint
-                #     self.save_checkpoint(step=global_step)
-                #     return
-
-            # # validation
-            # val_losses = []
-            # for data in self.val_dataloader:
-            #     data = TensorDict(data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
-            #     val_loss = self.validation_step(data)
-            #     val_losses.append(val_loss)
-            # if rank == 0:
-            #     val_loss = torch.mean(torch.stack(val_losses))
-            #     metric = {'val/loss': val_loss.detach().item()}
-            #     tracking.log(data=metric, step=global_step)
             torch.distributed.barrier()
 
             # save checkpoint

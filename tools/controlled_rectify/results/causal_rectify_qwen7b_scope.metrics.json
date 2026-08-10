@@ -1,0 +1,62 @@
+{
+  "n": 147,
+  "n_samples": 1,
+  "metrics": {
+    "freeform__full_regen": {
+      "W2C@1_pct": 21.09,
+      "PPR@1_pct": 17.69
+    },
+    "freeform__prefix_rewrite": {
+      "W2C@1_pct": 21.77,
+      "PPR@1_pct": 100.0
+    },
+    "localization__full_regen": {
+      "W2C@1_pct": 6.8,
+      "PPR@1_pct": 17.69
+    },
+    "localization__prefix_rewrite": {
+      "W2C@1_pct": 2.72,
+      "PPR@1_pct": 100.0
+    },
+    "localization_analysis__full_regen": {
+      "W2C@1_pct": 23.13,
+      "PPR@1_pct": 18.37
+    },
+    "localization_analysis__prefix_rewrite": {
+      "W2C@1_pct": 14.97,
+      "PPR@1_pct": 100.0
+    },
+    "localization_analysis_plan__full_regen": {
+      "W2C@1_pct": 21.77,
+      "PPR@1_pct": 23.13
+    },
+    "localization_analysis_plan__prefix_rewrite": {
+      "W2C@1_pct": 17.69,
+      "PPR@1_pct": 100.0
+    },
+    "regenerate__full_regen": {
+      "W2C@1_pct": 12.24,
+      "PPR@1_pct": 31.97
+    },
+    "regenerate__prefix_rewrite": {
+      "W2C@1_pct": 3.4,
+      "PPR@1_pct": 100.0
+    },
+    "shuffled_plan__full_regen": {
+      "W2C@1_pct": 0.0,
+      "PPR@1_pct": 16.33
+    },
+    "shuffled_plan__prefix_rewrite": {
+      "W2C@1_pct": 1.36,
+      "PPR@1_pct": 100.0
+    },
+    "wrong_only__full_regen": {
+      "W2C@1_pct": 6.12,
+      "PPR@1_pct": 25.17
+    },
+    "wrong_only__prefix_rewrite": {
+      "W2C@1_pct": 3.4,
+      "PPR@1_pct": 100.0
+    }
+  }
+}

@@ -16,7 +16,7 @@ Metrics related to the PPO trainer.
 """
 
 import torch
-from typing import Any, Dict, List, Callable
+from typing import Any, Dict, List, Callable, Optional
 import numpy as np
 from verl import DataProto
 from collections import Counter, defaultdict
@@ -533,3 +533,444 @@ def process_validation_metrics(data_sources: list[str],
                 data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(prompt_vals)
 
     return data_src2var2metric2val
+
+
+def collapse_slide_window_trajectories(
+    sample_inputs: list[str],
+    data_sources: np.ndarray,
+    infos_dict: dict[str, list[Any]],
+    window_expand: int,
+) -> tuple[list[str], np.ndarray, dict[str, list[Any]]]:
+    """Collapse slide_window packed rows into one record per trajectory sample.
+
+    Packed layout (interleave expand): for each traj, W consecutive rows with
+    window_index = 0..W-1. Invalid (unreached) windows are ignored.
+    Trajectory-level acc/pred come from the window at final_generation_turn.
+    """
+    n = len(sample_inputs)
+    if window_expand is None or window_expand <= 1 or n == 0:
+        out = {k: list(v) for k, v in infos_dict.items()}
+        if 'num_turns' not in out and 'final_turn' in out:
+            out['num_turns'] = [int(ft) + 1 for ft in out['final_turn']]
+        return sample_inputs, np.asarray(data_sources), out
+
+    if n % window_expand != 0:
+        raise ValueError(
+            f'slide_window val length {n} not divisible by window_expand={window_expand}'
+        )
+
+    n_traj = n // window_expand
+    window_index = infos_dict.get('window_index', [0] * n)
+    window_valid = infos_dict.get('window_valid', [True] * n)
+    final_turns = infos_dict.get('final_turn', [0] * n)
+    acc_t1 = infos_dict.get('acc_t1', infos_dict.get('acc', [0.0] * n))
+    pred_t1 = infos_dict.get('pred_t1', infos_dict.get('pred', [''] * n))
+    acc_t2 = infos_dict.get('acc_t2', [-1.0] * n)
+    pred_t2 = infos_dict.get('pred_t2', [''] * n)
+    genrm_pred = infos_dict.get('genrm_pred', ['none'] * n)
+    genrm_score = infos_dict.get('genrm_score', [0.0] * n)
+    genrm_probs = infos_dict.get('genrm_probs', [None] * n)
+    c_ver = infos_dict.get('c_ver', [0.0] * n)
+    c_rect = infos_dict.get('c_rect', [0.0] * n)
+    c_f = infos_dict.get('c_f', [0.0] * n)
+    ground_truth = infos_dict.get('ground_truth', [None] * n)
+    data_source_info = infos_dict.get('data_source', list(data_sources))
+
+    new_inputs: list[str] = []
+    new_sources: list[Any] = []
+    new_infos: dict[str, list[Any]] = defaultdict(list)
+
+    for t in range(n_traj):
+        base = t * window_expand
+        idxs = list(range(base, base + window_expand))
+        valid_idxs = [j for j in idxs if bool(window_valid[j])]
+        if not valid_idxs:
+            # should be rare; keep a zeroed traj row
+            chosen = base
+            ft = int(final_turns[base])
+            traj_acc = 0.0
+            traj_pred = ""
+            revised = False
+            y0_acc = 0.0
+            y1_acc = -1.0
+        else:
+            ft = int(final_turns[valid_idxs[0]])
+            # prefer the window that holds y_final (requires last answer was verified)
+            chosen = None
+            for j in valid_idxs:
+                if int(window_index[j]) == ft:
+                    chosen = j
+                    break
+            if chosen is None:
+                # Legacy mismatch: last answer only as rectify on previous window
+                last = max(valid_idxs, key=lambda j: int(window_index[j]))
+                if float(acc_t2[last]) >= 0.0:
+                    chosen = last
+                    ft = int(window_index[last]) + 1
+                    traj_acc = float(acc_t2[last])
+                    traj_pred = pred_t2[last]
+                else:
+                    chosen = last
+                    ft = int(window_index[chosen])
+                    traj_acc = float(acc_t1[chosen])
+                    traj_pred = pred_t1[chosen]
+            else:
+                traj_acc = float(acc_t1[chosen])
+                traj_pred = pred_t1[chosen]
+            # y0 / optional y1 for ECR from window 0
+            w0 = base  # window_index 0 row
+            y0_acc = float(acc_t1[w0]) if bool(window_valid[w0]) else 0.0
+            if ft >= 1:
+                # y1 from window0.acc_t2 or window1.acc_t1
+                if float(acc_t2[w0]) >= 0:
+                    y1_acc = float(acc_t2[w0])
+                elif base + 1 < base + window_expand and bool(window_valid[base + 1]):
+                    y1_acc = float(acc_t1[base + 1])
+                else:
+                    y1_acc = -1.0
+                revised = True
+            else:
+                y1_acc = -1.0
+                revised = False
+
+        new_inputs.append(sample_inputs[base])
+        new_sources.append(data_sources[base])
+        new_infos['acc'].append(float(traj_acc))
+        new_infos['pred'].append(traj_pred)
+        new_infos['acc_final'].append(float(traj_acc))
+        new_infos['acc_t1'].append(y0_acc)
+        new_infos['pred_t1'].append(pred_t1[base] if bool(window_valid[base]) else "")
+        new_infos['acc_t2'].append(y1_acc)
+        new_infos['pred_t2'].append(pred_t2[base] if revised else "")
+        new_infos['revised'].append(bool(revised))
+        new_infos['final_turn'].append(int(ft))
+        new_infos['num_turns'].append(int(ft) + 1)
+        new_infos['genrm_pred'].append(genrm_pred[base] if bool(window_valid[base]) else "none")
+        new_infos['genrm_score'].append(float(genrm_score[base]) if bool(window_valid[base]) else 0.0)
+        new_infos['genrm_probs'].append(genrm_probs[base] if bool(window_valid[base]) else None)
+        # feasibility: OR over valid windows (traj failed if any round failed)
+        new_infos['c_ver'].append(float(max(float(c_ver[j]) for j in valid_idxs)) if valid_idxs else 0.0)
+        new_infos['c_rect'].append(float(max(float(c_rect[j]) for j in valid_idxs)) if valid_idxs else 0.0)
+        new_infos['c_f'].append(float(max(float(c_f[j]) for j in valid_idxs)) if valid_idxs else 0.0)
+        new_infos['ground_truth'].append(ground_truth[chosen])
+        new_infos['data_source'].append(data_source_info[base])
+        new_infos['reward'].append(float(traj_acc))
+        new_infos['window_valid'].append(True)
+        new_infos['window_index'].append(0)
+
+    return new_inputs, np.asarray(new_sources), dict(new_infos)
+
+
+def compute_all_turn_event_metrics(infos_dict: dict[str, list[Any]]) -> dict[str, float]:
+    """Pool verify / rectify events over all valid turn-windows (not first-only).
+
+    For each window_valid row:
+      - one verify event on y_w (acc_t1 vs genrm)
+      - if acc_t2 >= 0, one rectify event y_w -> y_{w+1}
+    """
+    n = len(infos_dict.get('acc_t1', infos_dict.get('acc', [])))
+    if n == 0:
+        return {}
+
+    window_valid = infos_dict.get('window_valid', [True] * n)
+    acc_t1 = infos_dict.get('acc_t1', infos_dict.get('acc', [0.0] * n))
+    acc_t2 = infos_dict.get('acc_t2', [-1.0] * n)
+    genrm_score = infos_dict.get('genrm_score', [0.0] * n)
+    genrm_pred = infos_dict.get('genrm_pred', ['none'] * n)
+
+    # --- all verifies ---
+    # Standard confusion (verify predicts "correct"):
+    #   TP: said correct, was correct
+    #   FN: said wrong,   was correct
+    #   TN: said wrong,   was wrong
+    #   FP: said correct, was wrong
+    TP = FP = FN = TN = 0
+    n_verify = 0
+    for i in range(n):
+        if not bool(window_valid[i]):
+            continue
+        gp = genrm_pred[i]
+        if gp in (None, 'none'):
+            continue
+        n_verify += 1
+        pol = float(acc_t1[i]) >= 0.5
+        # prefer explicit verdict; fall back to score
+        if gp in ('correct', 'wrong'):
+            ver = gp == 'correct'
+        else:
+            ver = float(genrm_score[i]) > 0.5
+        if ver and pol:
+            TP += 1
+        elif (not ver) and (not pol):
+            TN += 1
+        elif ver and (not pol):
+            FP += 1
+        else:
+            FN += 1
+
+    tpr = TP / (TP + FN) if (TP + FN) else 0.0
+    tnr = TN / (TN + FP) if (TN + FP) else 0.0
+    # legacy pag-style aliases (note: old FP/TN naming was swapped vs standard)
+    legacy_FP = TN  # said wrong & was wrong
+    legacy_TN = FP  # said correct & was wrong
+    metrics = {
+        'n_verify': float(n_verify),
+        'verify_TP': TP,
+        'verify_FP': legacy_FP,
+        'verify_FN': FN,
+        'verify_TN': legacy_TN,
+        'TPR': tpr,
+        'TNR': tnr,
+        'verify_recall': tpr,
+        'verify_recall_negative': tnr,
+        'verify_precision': TP / (TP + FP) if (TP + FP) else 0.0,
+        'verify_f1': (2 * TP / (2 * TP + FP + FN)) if (2 * TP + FP + FN) else 0.0,
+    }
+
+    # --- all rectifies ---
+    # ECR_TP: I→C count; EIR_FP: C→I count
+    ecr_tp = eir_fp = 0
+    n_rect = n_prev_wrong = n_prev_correct = 0
+    i_to_c = c_to_i = c_to_c = i_to_i = 0
+    for i in range(n):
+        if not bool(window_valid[i]):
+            continue
+        prev = float(acc_t1[i])
+        cur = float(acc_t2[i])
+        if cur < 0:
+            continue
+        n_rect += 1
+        prev_ok = prev >= 0.5
+        cur_ok = cur >= 0.5
+        if not prev_ok:
+            n_prev_wrong += 1
+            if cur_ok:
+                ecr_tp += 1
+                i_to_c += 1
+            else:
+                i_to_i += 1
+        else:
+            n_prev_correct += 1
+            if not cur_ok:
+                eir_fp += 1
+                c_to_i += 1
+            else:
+                c_to_c += 1
+
+    ecr = ecr_tp / n_prev_wrong if n_prev_wrong else 0.0
+    eir = eir_fp / n_prev_correct if n_prev_correct else 0.0
+    metrics.update({
+        'n_rectify': float(n_rect),
+        'ECR_TP': ecr_tp,
+        'EIR_FP': eir_fp,
+        'ECR': ecr,
+        'EIR': eir,
+        'i_to_c_rate': ecr,
+        'c_to_i_rate': eir,
+        'i_to_c_count': i_to_c,
+        'c_to_i_count': c_to_i,
+        'i_to_i_count': i_to_i,
+        'c_to_c_count': c_to_c,
+    })
+    return metrics
+
+
+def compute_vf_target_audit(
+    costs: torch.Tensor,
+    returns_f: torch.Tensor,
+    values_f: torch.Tensor,
+    multiturn_mask: torch.Tensor,
+    window_valid: Optional[np.ndarray] = None,
+    eps: float = 1e-6,
+) -> Dict[str, float]:
+    """Audit what the failure critic actually regresses onto (token-level).
+
+    Compares sample-level P(c^F=1) with the distribution of ``returns_f`` under the
+    same ``multiturn_mask`` used by ``compute_value_loss``. If failure rate is ~30%
+    but E[returns_f|mask] and P(returns_f>0|mask) are near 0, the VF target is being
+    diluted / misaligned — not a "sparse failure" data problem.
+    """
+    mt = multiturn_mask.bool()
+    c = costs.float()
+    tgt = returns_f.float()
+    vf = values_f.float()
+    bsz = c.shape[0]
+
+    if window_valid is not None:
+        valid = torch.as_tensor(window_valid.astype(np.bool_), device=c.device)
+    else:
+        valid = torch.ones(bsz, dtype=torch.bool, device=c.device)
+    if not valid.any():
+        return {
+            'vf_audit/n_valid': 0.0,
+            'vf_audit/P_c_f': 0.0,
+            'vf_audit/P_target_pos': 0.0,
+            'vf_audit/E_target': 0.0,
+        }
+
+    # per-sample episode cost (same as J_F construction)
+    ep_cost = c.sum(dim=-1)
+    sample_fail = ep_cost > eps
+    p_c_f = sample_fail[valid].float().mean().item()
+
+    # token mask used by VF loss
+    row_mt = mt & valid.unsqueeze(-1)
+    n_mt = row_mt.sum().clamp(min=1).float()
+    tgt_mt = tgt[row_mt]
+    vf_mt = vf[row_mt]
+    c_mt = c[row_mt]
+
+    p_tgt_pos = (tgt_mt > eps).float().mean().item() if tgt_mt.numel() else 0.0
+    e_tgt = tgt_mt.mean().item() if tgt_mt.numel() else 0.0
+    e_tgt_max = tgt_mt.max().item() if tgt_mt.numel() else 0.0
+    e_vf = vf_mt.mean().item() if vf_mt.numel() else 0.0
+
+    cost_tok = row_mt & (c > eps)
+    n_cost = cost_tok.sum()
+    if n_cost > 0:
+        e_tgt_at_c = tgt[cost_tok].mean().item()
+        e_vf_at_c = vf[cost_tok].mean().item()
+        # among sample-fail rows, fraction of cost>0 tokens that sit inside multiturn_mask
+        # (should be ~1; <1 ⇒ cost written off-mask / indexing bug)
+        cost_all = (c > eps) & valid.unsqueeze(-1)
+        cov = ((c > eps) & mt & valid.unsqueeze(-1)).sum().float() / cost_all.sum().clamp(min=1).float()
+        mask_cov_on_cf = cov.item()
+    else:
+        e_tgt_at_c = 0.0
+        e_vf_at_c = 0.0
+        mask_cov_on_cf = 1.0
+
+    zero_tok = row_mt & (c <= eps)
+    if zero_tok.any():
+        e_tgt_at_zero_c = tgt[zero_tok].mean().item()
+        e_vf_at_zero_c = vf[zero_tok].mean().item()
+    else:
+        e_tgt_at_zero_c = 0.0
+        e_vf_at_zero_c = 0.0
+
+    # Dilution proxy: on failing samples, mean token target under multiturn vs at cost tokens
+    fail_rows = sample_fail & valid
+    if fail_rows.any():
+        dil_num = 0.0
+        dil_den = 0.0
+        for i in torch.where(fail_rows)[0].tolist():
+            m = mt[i]
+            if not m.any():
+                continue
+            dil_num += tgt[i][m].mean().item()
+            dil_den += 1.0
+        e_tgt_fail_seqmean = dil_num / max(dil_den, 1.0)
+        # expected if one unit cost smeared over L multiturn tokens
+        L = mt[fail_rows].float().sum(dim=-1).mean().item()
+    else:
+        e_tgt_fail_seqmean = 0.0
+        L = 0.0
+
+    # Theoretical MSE if critic predicts constant E[target|mask] (sanity vs logged vf_loss_f)
+    if tgt_mt.numel():
+        const = e_tgt
+        mse_const = 0.5 * ((tgt_mt - const) ** 2).mean().item()
+    else:
+        mse_const = 0.0
+
+    # Segment-end diagnostic: binary suffix G at each multiturn True-run end
+    # G_end = max_{t'>=end} c_{t'}  (token-wise max from that position)
+    g_ends = []
+    tgt_ends = []
+    c_ends = []
+    for i in torch.where(valid)[0].tolist():
+        m = mt[i]
+        if not m.any():
+            continue
+        ext = torch.cat([m, m.new_zeros(1, dtype=torch.bool)])
+        ends = (torch.where(ext[:-1] & ~ext[1:])[0]).tolist()  # inclusive end indices
+        # suffix max of costs (inclusive)
+        # reverse cummax then flip
+        c_i = c[i]
+        # for position t, max(c[t:])
+        rev = torch.flip(c_i, dims=[0])
+        suf = torch.flip(torch.cummax(rev, dim=0).values, dims=[0])
+        for e in ends:
+            g_ends.append(float(suf[e].item() > eps))
+            tgt_ends.append(float(tgt[i, e].item()))
+            c_ends.append(float(c_i[e].item()))
+
+    if g_ends:
+        g_arr = np.asarray(g_ends, dtype=np.float64)
+        t_arr = np.asarray(tgt_ends, dtype=np.float64)
+        c_arr = np.asarray(c_ends, dtype=np.float64)
+        p_g = float(g_arr.mean())
+        e_tgt_at_ends = float(t_arr.mean())
+        # where G=1, target should be high if cost-to-go is correct
+        if (g_arr > 0.5).any():
+            e_tgt_g1 = float(t_arr[g_arr > 0.5].mean())
+        else:
+            e_tgt_g1 = 0.0
+        if (g_arr <= 0.5).any():
+            e_tgt_g0 = float(t_arr[g_arr <= 0.5].mean())
+        else:
+            e_tgt_g0 = 0.0
+        p_c_at_ends = float((c_arr > eps).mean())
+    else:
+        p_g = 0.0
+        e_tgt_at_ends = 0.0
+        e_tgt_g1 = 0.0
+        e_tgt_g0 = 0.0
+        p_c_at_ends = 0.0
+
+    return {
+        'vf_audit/n_valid': float(valid.sum().item()),
+        'vf_audit/P_c_f': float(p_c_f),
+        'vf_audit/P_target_pos': float(p_tgt_pos),
+        'vf_audit/E_target': float(e_tgt),
+        'vf_audit/max_target': float(e_tgt_max),
+        'vf_audit/E_target_at_c_pos': float(e_tgt_at_c),
+        'vf_audit/E_target_at_zero_c': float(e_tgt_at_zero_c),
+        'vf_audit/E_vf': float(e_vf),
+        'vf_audit/E_vf_at_c_pos': float(e_vf_at_c),
+        'vf_audit/E_vf_at_zero_c': float(e_vf_at_zero_c),
+        'vf_audit/mask_coverage_on_c_pos': float(mask_cov_on_cf),
+        'vf_audit/E_target_fail_seqmean': float(e_tgt_fail_seqmean),
+        'vf_audit/mean_multiturn_len_fail': float(L),
+        'vf_audit/mse_const_at_E_target': float(mse_const),
+        # answer/segment-end diagnostic (not a methodology change)
+        'vf_audit/P_G_at_seg_end': float(p_g),
+        'vf_audit/E_target_at_seg_end': float(e_tgt_at_ends),
+        'vf_audit/E_target_at_seg_end_G1': float(e_tgt_g1),
+        'vf_audit/E_target_at_seg_end_G0': float(e_tgt_g0),
+        'vf_audit/P_c_at_seg_end': float(p_c_at_ends),
+    }
+
+
+def compute_trajectory_val_metrics(infos_dict: dict[str, list[Any]]) -> dict[str, float]:
+    """Per-trajectory validation metrics (equal weight per sample, not per window).
+
+    Verify/rectify event rates are NOT computed here — use
+    ``compute_all_turn_event_metrics`` on pre-collapse window rows.
+    """
+    acc = np.asarray(infos_dict.get('acc_final', infos_dict.get('acc', [])), dtype=np.float64)
+    if acc.size == 0:
+        return {}
+    turns = np.asarray(
+        infos_dict.get('num_turns', [int(t) + 1 for t in infos_dict.get('final_turn', [0] * len(acc))]),
+        dtype=np.float64,
+    )
+    y0 = np.asarray(infos_dict.get('acc_t1', acc), dtype=np.float64)
+    revised = np.asarray(infos_dict.get('revised', [False] * len(acc)), dtype=bool)
+
+    correct = acc >= 0.5
+    metrics = {
+        'final_acc': float(acc.mean()),
+        'turn1_acc': float(y0.mean()),
+        'mean_turns': float(turns.mean()),
+        'mean_turns_correct': float(turns[correct].mean()) if correct.any() else 0.0,
+        'mean_turns_incorrect': float(turns[~correct].mean()) if (~correct).any() else 0.0,
+        'early_stop_rate': float((turns <= 1).mean()),
+        'revised_rate': float(revised.mean()),
+        'n_traj': float(len(acc)),
+    }
+    if 'c_ver' in infos_dict:
+        metrics['c_ver_rate'] = float(np.mean(infos_dict['c_ver']))
+        metrics['c_rect_rate'] = float(np.mean(infos_dict['c_rect']))
+        metrics['c_f_rate'] = float(np.mean(infos_dict['c_f']))
+    return metrics

@@ -1,0 +1,30 @@
+{
+  "n": 5,
+  "n_samples": 1,
+  "metrics": {
+    "localization_analysis_plan__full_regen": {
+      "W2C@1_pct": 20.0,
+      "PPR@1_pct": 40.0
+    },
+    "localization_analysis_plan__prefix_rewrite": {
+      "W2C@1_pct": 20.0,
+      "PPR@1_pct": 100.0
+    },
+    "regenerate__full_regen": {
+      "W2C@1_pct": 40.0,
+      "PPR@1_pct": 40.0
+    },
+    "regenerate__prefix_rewrite": {
+      "W2C@1_pct": 0.0,
+      "PPR@1_pct": 100.0
+    },
+    "shuffled_plan__full_regen": {
+      "W2C@1_pct": 20.0,
+      "PPR@1_pct": 40.0
+    },
+    "shuffled_plan__prefix_rewrite": {
+      "W2C@1_pct": 20.0,
+      "PPR@1_pct": 100.0
+    }
+  }
+}

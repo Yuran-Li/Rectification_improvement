@@ -242,8 +242,15 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages', 'multiturn_mask']
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
+        # Feasibility-gated expert BC (optional tensors from trainer)
+        for k in ('expert_token_mask', 'feas_gate', 'feas_weight'):
+            if k in data.batch.keys():
+                select_keys.append(k)
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
+        expert_bc_coef = float(self.config.get('expert_bc_coef', 0.0))
+        # Light BC weight on successful expert spans even when feasible (no-API warmup)
+        expert_bc_light = float(self.config.get('expert_bc_light', 0.0))
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
@@ -296,15 +303,23 @@ class DataParallelPPOActor(BasePPOActor):
                     # all return: (bsz, response_length)
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
                     
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=multiturn_mask,
-                        cliprange=clip_ratio,
-                        cliprange_low=clip_ratio_low,
-                        cliprange_high=clip_ratio_high,
-                        clip_ratio_c=clip_ratio_c)
+                    # Always keep PG (multiturn). Feasibility only up-weights expert BC below.
+                    ppo_mask = multiturn_mask
+                    if ppo_mask.float().sum() < 1:
+                        pg_loss = (log_prob * 0).sum()
+                        pg_clipfrac = torch.tensor(0.0, device=log_prob.device)
+                        ppo_kl = torch.tensor(0.0, device=log_prob.device)
+                        pg_clipfrac_lower = torch.tensor(0.0, device=log_prob.device)
+                    else:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=ppo_mask,
+                            cliprange=clip_ratio,
+                            cliprange_low=clip_ratio_low,
+                            cliprange_high=clip_ratio_high,
+                            clip_ratio_c=clip_ratio_c)
                     # compute entropy loss from entropy
                     entropy_loss = agg_loss(loss_mat=entropy, loss_mask=multiturn_mask, loss_agg_mode=loss_agg_mode)
 
@@ -325,6 +340,42 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics['actor/kl_loss'] = kl_loss.detach().item()
                         metrics['actor/kl_coef'] = self.config.kl_loss_coef
 
+                    # Expert BC (weighted):
+                    #   infeasible → high w = (1-g)*max(feas_weight,1)
+                    #   feasible + expert_bc_light → light w on successful spans
+                    bc_loss_val = 0.0
+                    bc_scale_val = 0.0
+                    if expert_bc_coef > 0 and 'expert_token_mask' in data:
+                        expert_mask = data['expert_token_mask'].float()
+                        row_w = torch.zeros(
+                            expert_mask.size(0), 1, device=expert_mask.device, dtype=expert_mask.dtype
+                        )
+                        if 'feas_gate' in data:
+                            g = data['feas_gate'].float()
+                            if g.dim() == 1:
+                                g = g.unsqueeze(-1)
+                            row_w = (1.0 - g)
+                        if 'feas_weight' in data:
+                            w = data['feas_weight'].float()
+                            if w.dim() == 1:
+                                w = w.unsqueeze(-1)
+                            infeas = row_w
+                            row_w = infeas * torch.clamp(w, min=1.0)
+                        if expert_bc_light > 0:
+                            # successful expert rows still get a small BC even if feasible
+                            has_e = (expert_mask.reshape(expert_mask.size(0), -1).sum(dim=-1, keepdim=True) > 0).float()
+                            row_w = torch.maximum(row_w, expert_bc_light * has_e)
+                        expert_mask = expert_mask * row_w
+                        if expert_mask.sum() > 0:
+                            bc_loss = agg_loss(
+                                loss_mat=-log_prob,
+                                loss_mask=expert_mask,
+                                loss_agg_mode=loss_agg_mode,
+                            )
+                            policy_loss = policy_loss + expert_bc_coef * bc_loss
+                            bc_loss_val = float(bc_loss.detach().item())
+                            bc_scale_val = float(row_w.mean().item())
+
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
@@ -338,6 +389,8 @@ class DataParallelPPOActor(BasePPOActor):
                         'actor/pg_clipfrac': pg_clipfrac.detach().item(),
                         'actor/ppo_kl': ppo_kl.detach().item(),
                         'actor/pg_clipfrac_lower': pg_clipfrac_lower.detach().item(),
+                        'actor/expert_bc_loss': bc_loss_val,
+                        'actor/expert_bc_row_w_mean': bc_scale_val,
                     }
                     append_to_dict(metrics, data)
 

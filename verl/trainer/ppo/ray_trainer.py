@@ -39,7 +39,19 @@ from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.metric_utils import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics, reduce_metrics, bootstrap_metric, calc_maj_val, process_validation_metrics
+from verl.trainer.ppo.metric_utils import (
+    compute_data_metrics,
+    compute_throughout_metrics,
+    compute_timing_metrics,
+    reduce_metrics,
+    bootstrap_metric,
+    calc_maj_val,
+    process_validation_metrics,
+    collapse_slide_window_trajectories,
+    compute_trajectory_val_metrics,
+    compute_all_turn_event_metrics,
+    compute_vf_target_audit,
+)
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
@@ -137,6 +149,7 @@ class ResourcePoolManager:
 
 import torch
 from verl.utils.torch_functional import masked_mean
+import verl.utils.torch_functional as verl_F
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty='kl'):
@@ -199,7 +212,15 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, norm_type="whole"):
+def compute_advantage(data: DataProto,
+                      adv_estimator,
+                      gamma=1.0,
+                      lam=1.0,
+                      num_repeat=1,
+                      norm_type="whole",
+                      lagrange_lambda: float = 0.0,
+                      cost_gamma: float = None,
+                      dual_critic: bool = False):
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch.keys():
         data.batch['response_mask'] = compute_response_mask(data)
@@ -221,6 +242,42 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                                                                       norm_type=norm_type)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+        data.batch['advantages_r'] = advantages
+
+        # Dual critic: turn-level MC cost-to-go G_F at answer routing states (not token GAE).
+        # feasibility_returns[s_k] = Σ_{j≥k} γ_F^{j-k} c_{j+1}^F; VF/A_f only meaningful there.
+        use_dual = (
+            dual_critic
+            and 'values_f' in data.batch.keys()
+            and multiturn_mask is not None
+        )
+        if use_dual and 'feasibility_returns' in data.batch.keys():
+            returns_f = data.batch['feasibility_returns']
+            values_f = data.batch['values_f']
+            advantages_f = returns_f - values_f
+            fm = data.batch.get('feasibility_mask', None)
+            if fm is not None and fm.any():
+                # Whiten A_f only over routing states (avoid diluting with token zeros)
+                advantages_f = verl_F.masked_whiten(advantages_f, fm.float())
+                advantages_f = advantages_f * fm.float()
+            data.batch['advantages_f'] = advantages_f
+            data.batch['returns_f'] = returns_f
+            data.batch['advantages'] = advantages - float(lagrange_lambda) * advantages_f
+        elif use_dual and 'token_level_costs' in data.batch.keys():
+            # Legacy fallback: token-level cost GAE (should not run once feasibility_returns is set)
+            gamma_f = gamma if cost_gamma is None else cost_gamma
+            advantages_f, returns_f = core_algos.compute_gae_advantage_return(
+                token_level_rewards=data.batch['token_level_costs'],
+                values=data.batch['values_f'],
+                eos_mask=data.batch['response_mask'],
+                gamma=gamma_f,
+                lam=lam,
+                multiturn_mask=multiturn_mask,
+                norm_type=norm_type,
+            )
+            data.batch['advantages_f'] = advantages_f
+            data.batch['returns_f'] = returns_f
+            data.batch['advantages'] = advantages - float(lagrange_lambda) * advantages_f
     elif adv_estimator == AdvantageEstimator.GRPO:
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch['token_level_rewards'],
@@ -346,8 +403,91 @@ class RayPPOTrainer(object):
         else:
             raise NotImplementedError
 
+        # Lagrangian dual for feasibility constraint J_F <= B_F
+        self.dual_critic = bool(self.config.algorithm.get('dual_critic', False))
+        self.lagrange_lambda = float(self.config.algorithm.get('lagrange_lambda_init', 0.0))
+        self.lagrange_lr = float(self.config.algorithm.get('lagrange_lr', 1e-3))
+        self.cost_budget = float(self.config.algorithm.get('cost_budget', 0.3))
+        self.cost_gamma = float(self.config.algorithm.get('cost_gamma', 0.9))
+        # Pure PPO for the first N steps (λ=0, no infeasible BC); V_F still trains.
+        self.constraint_warmup = int(self.config.algorithm.get('constraint_warmup', 50))
+        # Phase-3: infeasible → expert BC
+        self.expert_bc = bool(self.config.algorithm.get('expert_bc', False))
+        self.expert_buffer_capacity = int(self.config.algorithm.get('expert_buffer_capacity', 256))
+        self.bootstrap_same_uid = bool(self.config.algorithm.get('bootstrap_same_uid', True))
+        from verl.trainer.ppo.expert_buffer import ExpertBootstrapBuffer
+        self.expert_buffer = ExpertBootstrapBuffer(capacity=self.expert_buffer_capacity)
+        # Online GPT expert: on infeasible rows without bootstrap, call GPT then BC
+        self.online_gpt_expert = bool(self.config.algorithm.get('online_gpt_expert', False))
+        self.online_gpt_model = str(self.config.algorithm.get('online_gpt_model', 'gpt-4o'))
+        self.online_gpt_max_per_step = int(self.config.algorithm.get('online_gpt_max_per_step', 8))
+        self.online_gpt_prefer_bootstrap = bool(
+            self.config.algorithm.get('online_gpt_prefer_bootstrap', True)
+        )
+        self.online_gpt_num_workers = int(self.config.algorithm.get('online_gpt_num_workers', 4))
+        self._online_gpt_client = None
+        if self.dual_critic:
+            print(f"[feasibility] dual_critic=True λ={self.lagrange_lambda} "
+                  f"lr_λ={self.lagrange_lr} B_F={self.cost_budget} "
+                  f"cost_gae_γ={self.cost_gamma} "
+                  f"constraint_warmup={self.constraint_warmup}")
+        if self.expert_bc:
+            print(f"[feasibility] expert_bc=True buffer_cap={self.expert_buffer_capacity} "
+                  f"bootstrap_same_uid={self.bootstrap_same_uid}")
+        if self.online_gpt_expert:
+            print(f"[feasibility] online_gpt_expert=True model={self.online_gpt_model} "
+                  f"max_per_step={self.online_gpt_max_per_step} "
+                  f"prefer_bootstrap={self.online_gpt_prefer_bootstrap}")
+
         self._validate_config()
         self._create_dataloader()
+
+    def _constraint_active(self) -> bool:
+        """True once past constraint_warmup (cost Lagrangian + infeasible BC/GPT)."""
+        return int(self.global_steps) >= int(self.constraint_warmup)
+
+    def _compute_feasibility_gates(self, batch: DataProto) -> DataProto:
+        """Per-sample V_F at answer routing states, gate g=1[V_F<=B_F]."""
+        if 'values_f' not in batch.batch:
+            return batch
+        vf = batch.batch['values_f']
+        if 'feasibility_mask' in batch.batch:
+            route = batch.batch['feasibility_mask'].bool()
+        elif 'multiturn_mask' in batch.batch:
+            # legacy fallback
+            mt = batch.batch['multiturn_mask'].bool()
+            route = mt
+        else:
+            return batch
+        denom = route.float().sum(dim=-1).clamp(min=1.0)
+        v_f_s = (vf * route.float()).sum(dim=-1) / denom
+        no_route = route.float().sum(dim=-1) == 0
+        if no_route.any():
+            v_f_s = torch.where(no_route, torch.zeros_like(v_f_s), v_f_s)
+        if 'window_valid' in batch.non_tensor_batch:
+            valid = torch.tensor(batch.non_tensor_batch['window_valid'].astype(np.bool_), device=v_f_s.device)
+            # invalid windows: treat as feasible (no BC/PPO pressure)
+            v_f_s = torch.where(valid, v_f_s, torch.zeros_like(v_f_s))
+        feas_gate = (v_f_s <= self.cost_budget).float()
+        feas_weight = (v_f_s - self.cost_budget).clamp(min=0.0, max=1.0)
+        batch.batch['feas_gate'] = feas_gate
+        batch.batch['feas_weight'] = feas_weight
+        batch.batch['v_f_state'] = v_f_s
+        return batch
+
+    def _feasibility_frac_valid(self, batch: DataProto) -> tuple[float, float]:
+        """feasible_frac / v_f_state_mean over window_valid rows only."""
+        gate = batch.batch['feas_gate'].float()
+        v_f = batch.batch['v_f_state'].float()
+        if 'window_valid' in batch.non_tensor_batch:
+            valid = torch.tensor(
+                batch.non_tensor_batch['window_valid'].astype(np.bool_),
+                device=gate.device,
+            )
+            if valid.any():
+                return float(gate[valid].mean().item()), float(v_f[valid].mean().item())
+            return 1.0, 0.0
+        return float(gate.mean().item()), float(v_f.mean().item())
 
     def _validate_config(self):
         config = self.config
@@ -571,6 +711,8 @@ class RayPPOTrainer(object):
         sample_scores = []
         
         metric_dict = {}
+        # slide_window expand factor (constant across val batches)
+        val_window_expand = 1
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -583,11 +725,10 @@ class RayPPOTrainer(object):
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
                 return {}
 
-            # Store original inputs
+            # Store original inputs (extend after generate: slide_window may expand batch)
             input_ids = test_batch.batch['input_ids']
             # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
 
             # Keep GT for oracle/always revise gates before popping tensors.
             revise_gate = self.config.actor_rollout_ref.rollout.val_kwargs.get('revise_gate', 'pag')
@@ -631,15 +772,38 @@ class RayPPOTrainer(object):
             # TODO: multi-turn evaluation
             test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
 
-            # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
-            print('validation generation end')
+            # slide_window expands each input row into window_expand packed rows, so DP pad
+            # must be removed as pad_size * window_expand (not pad_size).
+            window_expand = int(test_output_gen_batch_padded.meta_info.get('window_expand', 0) or 0)
+            if window_expand <= 0:
+                window_expand = max(
+                    1, len(test_output_gen_batch_padded) // max(len(test_gen_batch_padded), 1)
+                )
+            test_output_gen_batch = unpad_dataproto(
+                test_output_gen_batch_padded, pad_size=pad_size * window_expand
+            )
+            print(
+                f'validation generation end (window_expand={window_expand}, '
+                f'pad_size={pad_size}, unpad_rows={pad_size * window_expand}, '
+                f'out_len={len(test_output_gen_batch)}, test_len={len(test_batch)})'
+            )
+
+            if window_expand > 1:
+                test_batch = test_batch.repeat(repeat_times=window_expand, interleave=True)
+                # keep sample_inputs aligned with expanded scores / data_sources
+                input_texts = [t for t in input_texts for _ in range(window_expand)]
+            sample_inputs.extend(input_texts)
 
             # Store generated outputs
             output_ids = test_output_gen_batch.batch['responses']
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
+            assert len(test_batch) == len(test_output_gen_batch), (
+                f'val batch/gen size mismatch after window expand: '
+                f'{len(test_batch)} vs {len(test_output_gen_batch)} '
+                f'(window_expand={window_expand}, pad_size={pad_size})'
+            )
             test_batch = test_batch.union(test_output_gen_batch)
 
             # evaluate using reward_function
@@ -648,21 +812,17 @@ class RayPPOTrainer(object):
             
             if isinstance(result, dict) and "reward_tensor" in result:
                 reward_tensor = result["reward_tensor"]
-                reward_metrics = result.get("metrics", {})
-                
-                # 添加多轮验证指标
-                if reward_metrics:
-                    val_multiturn_metrics = {f'val/multiturn/{k}': v for k, v in reward_metrics.items()}
-                    metric_dict.update(val_multiturn_metrics)
             else:
                 reward_tensor = result
+
+            val_window_expand = max(val_window_expand, int(window_expand))
 
             # Store scores
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
             reward_extra_infos_dict["reward"].extend(scores)
-            if "reward_extra_info" in result:
+            if isinstance(result, dict) and "reward_extra_info" in result:
                 for key, lst in result["reward_extra_info"].items():
                     reward_extra_infos_dict[key].extend(lst)
 
@@ -674,15 +834,40 @@ class RayPPOTrainer(object):
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 
         data_sources = np.concatenate(data_source_lst, axis=0)
+
+        # Event metrics over ALL valid verify/rectify turns (pre-collapse windows).
+        event_metrics = compute_all_turn_event_metrics(reward_extra_infos_dict)
+        for k, v in event_metrics.items():
+            metric_dict[f'val/multiturn/{k}'] = v
+
+        # Collapse slide_window rows → one traj per (problem, sample), then aggregate.
+        traj_inputs, traj_sources, traj_infos = collapse_slide_window_trajectories(
+            sample_inputs=sample_inputs,
+            data_sources=data_sources,
+            infos_dict=reward_extra_infos_dict,
+            window_expand=val_window_expand,
+        )
+        traj_metrics = compute_trajectory_val_metrics(traj_infos)
+        for k, v in traj_metrics.items():
+            metric_dict[f'val/multiturn/{k}'] = v
+        print(
+            f"val traj metrics (window_expand={val_window_expand}, "
+            f"n_rows={len(sample_inputs)}, n_traj={len(traj_inputs)}): "
+            f"final_acc={traj_metrics.get('final_acc')}, "
+            f"mean_turns={traj_metrics.get('mean_turns')}, "
+            f"TPR={event_metrics.get('TPR')}, TNR={event_metrics.get('TNR')}, "
+            f"ECR={event_metrics.get('ECR')}, EIR={event_metrics.get('EIR')}, "
+            f"n_verify={event_metrics.get('n_verify')}, n_rectify={event_metrics.get('n_rectify')}"
+        )
         
         save_validation_results = self.config.trainer.get('save_validation_results', False)
         json_path = self.config.trainer.get('validation_results_path', 'validation_results.json')
         
         if save_validation_results:
             saved_file = save_validation_results_to_json(
-                data_sources=data_sources,
-                sample_inputs=sample_inputs,
-                infos_dict=reward_extra_infos_dict,
+                data_sources=traj_sources,
+                sample_inputs=traj_inputs,
+                infos_dict=traj_infos,
                 json_path=json_path
             )
 
@@ -694,20 +879,20 @@ class RayPPOTrainer(object):
             os.makedirs(save_dir, exist_ok=True)
             
             with open(os.path.join(save_dir, "data_sources.pkl"), "wb") as f:
-                pickle.dump(data_sources, f)
+                pickle.dump(traj_sources, f)
             
             with open(os.path.join(save_dir, "sample_inputs.pkl"), "wb") as f:
-                pickle.dump(sample_inputs, f)
+                pickle.dump(traj_inputs, f)
                 
             with open(os.path.join(save_dir, "reward_extra_infos.pkl"), "wb") as f:
-                pickle.dump(reward_extra_infos_dict, f)
+                pickle.dump(traj_infos, f)
                 
             print(f"Validation data saved to {save_dir}")
 
         data_src2var2metric2val = process_validation_metrics(
-            data_sources=data_sources, 
-            sample_inputs=sample_inputs, 
-            infos_dict=reward_extra_infos_dict
+            data_sources=traj_sources,
+            sample_inputs=traj_inputs,
+            infos_dict=traj_infos,
         )
         
         # 将其它指标也添加到metric_dict中
@@ -994,7 +1179,15 @@ class RayPPOTrainer(object):
                     batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                                                              dtype=object)
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    # slide_window packs each trajectory into window_expand training rows
+                    n_rollout = self.config.actor_rollout_ref.rollout.n
+                    window_expand = int(gen_batch_output.meta_info.get('window_expand', 0) or 0)
+                    if window_expand <= 0:
+                        window_expand = max(1, len(gen_batch_output) // max(len(batch) * n_rollout, 1))
+                    batch = batch.repeat(
+                        repeat_times=n_rollout * window_expand,
+                        interleave=True,
+                    )
                     batch = batch.union(gen_batch_output)
 
                     batch.batch['response_mask'] = compute_response_mask(batch)
@@ -1040,14 +1233,34 @@ class RayPPOTrainer(object):
                             reward_tensor = reward_result['reward_tensor']
                             reward_extra_infos_dict = reward_result['reward_extra_info']
                             reward_metrics = reward_result['metrics']
+                            cost_tensor = reward_result.get('cost_tensor', None)
+                            expert_token_mask = reward_result.get('expert_token_mask', None)
+                            feasibility_mask = reward_result.get('feasibility_mask', None)
+                            feasibility_returns = reward_result.get('feasibility_returns', None)
+                            c_f_discounted = reward_result.get('c_f_discounted', None)
                         except Exception as e:
                             print(f'Error in reward_fn: {e}')
                             reward_tensor = self.reward_fn(batch)
                             reward_extra_infos_dict = {}
                             reward_metrics = {}
+                            cost_tensor = None
+                            expert_token_mask = None
+                            feasibility_mask = None
+                            feasibility_returns = None
+                            c_f_discounted = None
                         multiturn_metrics = {f'multiturn/{k}': v for k, v in reward_metrics.items()}
                         metrics.update(multiturn_metrics)
                         batch.batch['token_level_scores'] = reward_tensor
+                        if cost_tensor is not None:
+                            batch.batch['token_level_costs'] = cost_tensor
+                        if expert_token_mask is not None:
+                            batch.batch['expert_token_mask'] = expert_token_mask
+                        if feasibility_mask is not None:
+                            batch.batch['feasibility_mask'] = feasibility_mask
+                        if feasibility_returns is not None:
+                            batch.batch['feasibility_returns'] = feasibility_returns
+                        if c_f_discounted is not None:
+                            batch.batch['c_f_discounted'] = c_f_discounted
 
                         print(f'{list(reward_extra_infos_dict.keys())=}')
                         if reward_extra_infos_dict:
@@ -1064,12 +1277,95 @@ class RayPPOTrainer(object):
 
                         # compute advantages, executed on the driver process
                         assert self.config.algorithm.adv_estimator == 'gae', "Currently, only PPO is supported for multi-turn"
-                        batch = compute_advantage(batch,
-                                                  adv_estimator=self.config.algorithm.adv_estimator,
-                                                  gamma=self.config.algorithm.gamma,
-                                                  lam=self.config.algorithm.lam,
-                                                  num_repeat=self.config.actor_rollout_ref.rollout.n,
-                                                  norm_type=self.config.algorithm.norm_type)
+                        constraint_active = self._constraint_active()
+                        # Warmup: still build returns_f for V_F, but λ=0 → pure reward PPO
+                        eff_lambda = self.lagrange_lambda if constraint_active else 0.0
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            norm_type=self.config.algorithm.norm_type,
+                            lagrange_lambda=eff_lambda,
+                            cost_gamma=self.cost_gamma,
+                            dual_critic=self.dual_critic,
+                        )
+
+                        # Dual ascent: J_F = E[Σ_i γ_F^{i-1} c_i^F] (turn-level), not token-mean
+                        if self.dual_critic and (
+                            'c_f_discounted' in batch.batch or 'token_level_costs' in batch.batch
+                        ):
+                            if 'c_f_discounted' in batch.batch:
+                                ep_cost = batch.batch['c_f_discounted'].float()
+                            else:
+                                ep_cost = (batch.batch['token_level_costs'].sum(dim=-1) > 0).float()
+                            if 'window_valid' in batch.non_tensor_batch:
+                                valid = torch.tensor(
+                                    batch.non_tensor_batch['window_valid'].astype(np.float32),
+                                    device=ep_cost.device,
+                                )
+                                j_f = (ep_cost * valid).sum() / valid.sum().clamp(min=1.0)
+                            else:
+                                j_f = ep_cost.mean()
+                            j_f_val = float(j_f.item())
+                            if constraint_active:
+                                self.lagrange_lambda = max(
+                                    0.0,
+                                    self.lagrange_lambda + self.lagrange_lr * (j_f_val - self.cost_budget),
+                                )
+                            metrics.update({
+                                'feasibility/J_F': j_f_val,
+                                'feasibility/B_F': self.cost_budget,
+                                'feasibility/lagrange_lambda': self.lagrange_lambda,
+                                'feasibility/constraint_violation': j_f_val - self.cost_budget,
+                                'feasibility/constraint_active': float(constraint_active),
+                                'feasibility/constraint_warmup': float(self.constraint_warmup),
+                            })
+
+                            # VF target audit on routing-state mask (feasibility_mask)
+                            if 'returns_f' in batch.batch and 'values_f' in batch.batch:
+                                wv = batch.non_tensor_batch.get('window_valid', None)
+                                route = batch.batch.get('feasibility_mask', batch.batch['multiturn_mask'])
+                                audit = compute_vf_target_audit(
+                                    costs=batch.batch.get(
+                                        'token_level_costs',
+                                        torch.zeros_like(batch.batch['returns_f']),
+                                    ),
+                                    returns_f=batch.batch['returns_f'],
+                                    values_f=batch.batch['values_f'],
+                                    multiturn_mask=route,
+                                    window_valid=wv,
+                                )
+                                metrics.update(audit)
+                                if int(self.global_steps) % 10 == 0:
+                                    print(
+                                        "[vf_audit] "
+                                        f"P_c_f={audit['vf_audit/P_c_f']:.3f} "
+                                        f"P_target_pos={audit['vf_audit/P_target_pos']:.4f} "
+                                        f"E_target={audit['vf_audit/E_target']:.4f} "
+                                        f"E_target|c>0={audit['vf_audit/E_target_at_c_pos']:.4f} "
+                                        f"fail_seqmean={audit['vf_audit/E_target_fail_seqmean']:.4f} "
+                                        f"n_route_mask_tokens={route.float().sum().item():.0f} "
+                                        f"P_G_seg={audit['vf_audit/P_G_at_seg_end']:.3f} "
+                                        f"E_tgt|G1={audit['vf_audit/E_target_at_seg_end_G1']:.4f}"
+                                    )
+
+                        # Feasibility gate + expert buffer for BC
+                        if self.expert_bc or self.dual_critic:
+                            batch = self._compute_feasibility_gates(batch)
+                            if 'feas_gate' in batch.batch:
+                                frac, vf_m = self._feasibility_frac_valid(batch)
+                                metrics['feasibility/feasible_frac'] = frac
+                                metrics['feasibility/v_f_state_mean'] = vf_m
+                                # Warmup: force feasible so actor skips infeasible BC path
+                                if not constraint_active:
+                                    batch.batch['feas_gate'] = torch.ones_like(batch.batch['feas_gate'])
+                                    batch.batch['feas_weight'] = torch.zeros_like(batch.batch['feas_weight'])
+                            if 'expert_token_mask' in batch.batch:
+                                n_push = self.expert_buffer.push_from_batch(batch)
+                                metrics['feasibility/expert_buffer_size'] = len(self.expert_buffer)
+                                metrics['feasibility/expert_pushed'] = n_push
 
                     # update critic
                     if self.use_critic:
@@ -1077,6 +1373,55 @@ class RayPPOTrainer(object):
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
                         metrics.update(critic_output_metrics)
+
+                    # Same-uid bootstrap transfer (no API): success → infeasible sibling
+                    if (
+                        self.expert_bc
+                        and self.bootstrap_same_uid
+                        and self._constraint_active()
+                        and self.config.trainer.critic_warmup <= self.global_steps
+                        and 'feas_gate' in batch.batch
+                        and 'expert_token_mask' in batch.batch
+                    ):
+                        with _timer('bootstrap_transfer', timing_raw):
+                            from verl.trainer.ppo.expert_buffer import transfer_same_uid_bootstrap
+                            batch, xfer_metrics = transfer_same_uid_bootstrap(batch)
+                            metrics.update(xfer_metrics)
+
+                    # Online GPT expert for infeasible tasks (after critic, before actor)
+                    if (
+                        self.online_gpt_expert
+                        and self.expert_bc
+                        and self._constraint_active()
+                        and self.config.trainer.critic_warmup <= self.global_steps
+                        and 'feas_gate' in batch.batch
+                    ):
+                        with _timer('online_gpt_expert', timing_raw):
+                            try:
+                                if self._online_gpt_client is None:
+                                    from verl.trainer.ppo.online_gpt_expert import OnlineGPTExpertClient
+                                    self._online_gpt_client = OnlineGPTExpertClient(
+                                        model=self.online_gpt_model,
+                                    )
+                                from verl.trainer.ppo.online_gpt_expert import (
+                                    fill_infeasible_with_online_gpt,
+                                )
+                                batch, gpt_metrics = fill_infeasible_with_online_gpt(
+                                    batch,
+                                    tokenizer=self.tokenizer,
+                                    client=self._online_gpt_client,
+                                    max_per_step=self.online_gpt_max_per_step,
+                                    prefer_bootstrap=self.online_gpt_prefer_bootstrap,
+                                    num_workers=self.online_gpt_num_workers,
+                                )
+                                metrics.update(gpt_metrics)
+                                if gpt_metrics.get('feasibility/online_gpt_filled', 0) > 0:
+                                    n_push = self.expert_buffer.push_from_batch(batch)
+                                    metrics['feasibility/expert_buffer_size'] = len(self.expert_buffer)
+                                    metrics['feasibility/expert_pushed_gpt'] = n_push
+                            except Exception as e:
+                                print(f'[online_gpt_expert] skipped this step: {e}')
+                                metrics['feasibility/online_gpt_error'] = 1.0
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:

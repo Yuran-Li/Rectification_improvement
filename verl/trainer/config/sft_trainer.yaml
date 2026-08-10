@@ -50,4 +50,10 @@ trainer:
   total_training_steps: null
   logger: ['console']
   seed: 1
+  # Periodic PAG multi-turn generative eval on MATH500 subset (0 disables)
+  eval_every: 0
+  eval_n_problems: 32
+  eval_data_path: null
+  eval_max_new_tokens: 1024
+  eval_temperature: 0.0
 

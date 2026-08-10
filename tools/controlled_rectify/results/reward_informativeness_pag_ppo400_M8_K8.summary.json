@@ -1,0 +1,39 @@
+{
+  "n_rows": 250,
+  "variance_decomposition": {
+    "mean_var_between": 0.028373046875,
+    "mean_var_within": 0.014375,
+    "pooled_rho": 0.6637273267236259,
+    "mean_rho_per_row": 0.5681469515483054,
+    "median_rho_per_row": 0.5851851851851851,
+    "pct_degenerate_both_dims": 69.2
+  },
+  "grpo_group_classification": {
+    "n_draws": 2000,
+    "pct_all_zero": 74.65,
+    "pct_all_one": 0.65,
+    "pct_informative": 24.7
+  },
+  "condition_comparison": {
+    "specific": {
+      "n": 250,
+      "CR@1_pct": 9.8,
+      "CR@K_pct": 13.4
+    },
+    "generic": {
+      "n": 250,
+      "CR@1_pct": 22.0,
+      "CR@K_pct": 44.4
+    },
+    "none": {
+      "n": 250,
+      "CR@1_pct": 20.4,
+      "CR@K_pct": 43.6
+    },
+    "independent": {
+      "n": 250,
+      "CR@1_pct": 26.8,
+      "CR@K_pct": 50.8
+    }
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "model_path": "/data/yuranli/hf-cache/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+  "data": "/data/yuranli/LLM/2026.04/github_references/Policy-As-GenVerifier/tools/controlled_rectify/data/fixed_wrong_pag_prerl_with_critique.jsonl",
+  "prompt_style": "pag_multiturn_verify_regenerate",
+  "n": 250,
+  "n_samples": 8,
+  "temperature": 0.7,
+  "metrics": {
+    "gen": {
+      "acc@1_pct": 2.4,
+      "pass@8_pct": 12.8
+    },
+    "fix": {
+      "acc@1_pct": 5.6,
+      "pass@8_pct": 22.8
+    },
+    "regen": {
+      "acc@1_pct": 16.0,
+      "pass@8_pct": 48.0
+    }
+  }
+}

@@ -44,6 +44,11 @@ actor_rollout_ref:
     use_torch_compile: True # False to disable torch compile
     kl_loss_coef: 0.001 # for grpo
     kl_loss_type: low_var_kl # for grpo
+    # Feasibility-gated expert BC coefficient (β_E); 0 disables
+    # Multiplier on infeasible BC; script default 2.0 for high-weight blend with PG
+    expert_bc_coef: 0.0
+    # Extra light weight on expert spans when feasible (0 = off)
+    expert_bc_light: 0.0
     ppo_epochs: 1
     shuffle: False
     ulysses_sequence_parallel_size: 1 # sp size
@@ -109,6 +114,9 @@ actor_rollout_ref:
     is_golden_generation: False
     is_only_genrm: False
     end_with_verifer: False
+    # Keep only (problem + latest answer [+ current verify/regen]) in context.
+    # Enables num_turns>2 without shortening response_length on 4k-context models.
+    slide_window: False
     val_kwargs:
       # sampling parameters for validation
       top_k: -1 # 0 for hf rollout, -1 for vllm rollout
@@ -135,6 +143,8 @@ critic:
     external_lib: ${actor_rollout_ref.model.external_lib}
     enable_gradient_checkpointing: True
     use_remove_padding: False
+    # 1 = VR only; 2 = dual VR (reward) + VF (failure cost)
+    num_labels: 1
     fsdp_config:
       param_offload: False
       optimizer_offload: False
@@ -155,6 +165,8 @@ critic:
   shuffle: ${actor_rollout_ref.actor.shuffle}
   grad_clip: 1.0
   cliprange_value: 0.5
+  # weight for VF value-loss when num_labels=2
+  vf_loss_coef: 1.0
   checkpoint:
     contents: ['model', 'optimizer', 'extra']  # with 'hf_model' you can save whole model as hf format, now only use sharded model checkpoint to save space
 
@@ -184,6 +196,11 @@ reward_model:
   end_with_verifer: ${actor_rollout_ref.rollout.end_with_verifer}
   policy_rs: False
   rs_coef: 10.0
+  # Feasibility-guided role rewards (PAGRewardManager)
+  utility_aware: False
+  alpha: 1.0   # rectify benefit weight
+  beta: 0.5    # verify utility weight
+  gamma_f: 0.9 # turn-level γ_F: C_F=Σ_i γ^{i-1} c_i^F and G_F at answer states
   compute_score: null
 
 custom_reward_function:
@@ -197,6 +214,26 @@ algorithm:
   use_kl_in_reward: False
   kl_penalty: kl  # how to estimate kl divergence
   norm_type: whole
+  # Feasibility-guided CMDP: max J_R s.t. J_F <= B_F via Lagrangian
+  dual_critic: False
+  lagrange_lambda_init: 0.0
+  lagrange_lr: 0.001
+  cost_budget: 0.3   # B_F
+  cost_gamma: 1.0    # unused when feasibility_returns set (legacy token-GAE fallback only)
+  # Steps with pure PPO (λ=0, no infeasible BC/GPT). Still trains V_F. 0 = off.
+  constraint_warmup: 50
+  # When V_F > B_F: keep PG, add high-weight expert BC (see actor.expert_bc_coef)
+  expert_bc: False
+  expert_buffer_capacity: 256
+  # Copy same-uid successful bootstrap traj onto infeasible siblings (no API)
+  bootstrap_same_uid: True
+  # Online GPT expert: for infeasible rows without bootstrap, call GPT then BC
+  # Needs OPENAI_API_KEY (+ optional OPENAI_BASE_URL)
+  online_gpt_expert: False
+  online_gpt_model: gpt-4o
+  online_gpt_max_per_step: 8
+  online_gpt_prefer_bootstrap: True
+  online_gpt_num_workers: 4
   kl_ctrl:
     type: fixed
     kl_coef: 0.001

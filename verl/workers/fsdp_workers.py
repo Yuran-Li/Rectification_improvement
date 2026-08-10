@@ -715,7 +715,10 @@ class CriticWorker(Worker):
 
         trust_remote_code = False
         critic_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
-        critic_model_config.num_labels = 1
+        # 1 = standard VR; 2 = dual VR/VF (feasibility-guided)
+        critic_model_config.num_labels = int(self.config.model.get('num_labels', 1))
+        if self.rank == 0:
+            print(f'Critic num_labels={critic_model_config.num_labels}')
 
         init_context = get_init_weight_context_manager(use_meta_tensor=not critic_model_config.tie_word_embeddings,
                                                        mesh=self.device_mesh)
@@ -849,7 +852,16 @@ class CriticWorker(Worker):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
             values = self.critic.compute_values(data=data)
-            output = DataProto.from_dict(tensors={'values': values})
+            if values.dim() == 3 and values.size(-1) >= 2:
+                # dual head: [:,:,0]=VR (reward), [:,:,1]=VF (failure cost)
+                output = DataProto.from_dict(tensors={
+                    'values': values[..., 0],
+                    'values_f': values[..., 1],
+                })
+            else:
+                if values.dim() == 3:
+                    values = values.squeeze(-1)
+                output = DataProto.from_dict(tensors={'values': values})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
 
         output = output.to('cpu')
