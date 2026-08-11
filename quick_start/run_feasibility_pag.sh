@@ -62,7 +62,7 @@ cost_budget="${COST_BUDGET:-0.3}"
 # live at segment ends; using 0.9 here wrongly decays across response tokens.
 cost_gamma="${COST_GAMMA:-1.0}"
 # Pure PPO for first N steps (λ=0, no infeasible BC); V_F still trains
-constraint_warmup="${CONSTRAINT_WARMUP:-50}"
+constraint_warmup="${CONSTRAINT_WARMUP:-20}"
 # Phase-3: infeasible → PG + high-weight expert BC (do not turn off PG)
 expert_bc="${EXPERT_BC:-True}"
 expert_bc_coef="${EXPERT_BC_COEF:-2.0}"
@@ -97,7 +97,7 @@ TOP_K="${TOP_K:--1}"
 # Previous default free_cache_engine=False + util=0.55 OOMs after val→train on 48G.
 ENFORCE_EAGER="${ENFORCE_EAGER:-True}"
 FREE_CACHE_ENGINE="${FREE_CACHE_ENGINE:-True}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.45}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.40}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
 PPO_MAX_TOKEN_LEN="${PPO_MAX_TOKEN_LEN:-12288}"
 
@@ -183,10 +183,10 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=$NNODES \
-    trainer.save_freq=50 \
+    trainer.save_freq="${SAVE_FREQ:-20}" \
     trainer.test_freq=10 \
     trainer.total_epochs=$TOTAL_EPOCHS \
     trainer.default_local_dir=$CKPT_PATH/$PROJECT_NAME/$EXPERIMENT_NAME \
     trainer.val_before_train=$VAL_BEFORE_TRAIN \
-    trainer.resume_mode=disable \
+    trainer.resume_mode="${RESUME_MODE:-auto}" \
     trainer.log_val_generations=2

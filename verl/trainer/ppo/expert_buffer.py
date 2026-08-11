@@ -24,6 +24,9 @@ def transfer_same_uid_bootstrap(batch: DataProto) -> Tuple[DataProto, Dict[str, 
     metrics = {
         "feasibility/bootstrap_transfer_candidates": 0.0,
         "feasibility/bootstrap_transfer_filled": 0.0,
+        # Full-row copy (input_ids+responses+masks): keeps expert conditioning intact.
+        # NOT cross-splicing y_{i+1}^B onto state (x,y_i^A).
+        "feasibility/bootstrap_transfer_same_window": 0.0,
     }
     if "expert_token_mask" not in batch.batch or "feas_gate" not in batch.batch:
         return batch, metrics
@@ -73,6 +76,8 @@ def transfer_same_uid_bootstrap(batch: DataProto) -> Tuple[DataProto, Dict[str, 
             if same_w:
                 cands = same_w
         src = int(cands[np.random.randint(len(cands))])
+        if window_index is not None and int(window_index[src]) == int(window_index[i]):
+            metrics["feasibility/bootstrap_transfer_same_window"] += 1.0
         for k in copy_keys:
             batch.batch[k][i] = batch.batch[k][src].clone()
         if "advantages" in batch.batch:

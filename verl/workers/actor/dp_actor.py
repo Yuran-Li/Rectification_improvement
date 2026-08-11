@@ -345,10 +345,18 @@ class DataParallelPPOActor(BasePPOActor):
                     #   feasible + expert_bc_light → light w on successful spans
                     bc_loss_val = 0.0
                     bc_scale_val = 0.0
+                    bc_weighted_val = 0.0
+                    bc_n_tokens = 0.0
+                    bc_n_samples = 0.0
+                    bc_n_high = 0.0
+                    bc_n_light = 0.0
                     if expert_bc_coef > 0 and 'expert_token_mask' in data:
-                        expert_mask = data['expert_token_mask'].float()
+                        expert_mask_raw = data['expert_token_mask'].float()
+                        has_e = (
+                            expert_mask_raw.reshape(expert_mask_raw.size(0), -1).sum(dim=-1, keepdim=True) > 0
+                        ).float()
                         row_w = torch.zeros(
-                            expert_mask.size(0), 1, device=expert_mask.device, dtype=expert_mask.dtype
+                            expert_mask_raw.size(0), 1, device=expert_mask_raw.device, dtype=expert_mask_raw.dtype
                         )
                         if 'feas_gate' in data:
                             g = data['feas_gate'].float()
@@ -361,19 +369,31 @@ class DataParallelPPOActor(BasePPOActor):
                                 w = w.unsqueeze(-1)
                             infeas = row_w
                             row_w = infeas * torch.clamp(w, min=1.0)
+                        high_rows = (row_w.squeeze(-1) > 0) & (has_e.squeeze(-1) > 0)
                         if expert_bc_light > 0:
                             # successful expert rows still get a small BC even if feasible
-                            has_e = (expert_mask.reshape(expert_mask.size(0), -1).sum(dim=-1, keepdim=True) > 0).float()
                             row_w = torch.maximum(row_w, expert_bc_light * has_e)
-                        expert_mask = expert_mask * row_w
+                        light_only = (
+                            (has_e.squeeze(-1) > 0)
+                            & (~high_rows)
+                            & (row_w.squeeze(-1) > 0)
+                        )
+                        expert_mask = expert_mask_raw * row_w
+                        # unweighted expert tokens (before row β); for coverage sanity
+                        bc_n_tokens = float(expert_mask_raw.sum().item())
+                        bc_n_samples = float(has_e.sum().item())
+                        bc_n_high = float(high_rows.sum().item())
+                        bc_n_light = float(light_only.sum().item())
                         if expert_mask.sum() > 0:
                             bc_loss = agg_loss(
                                 loss_mat=-log_prob,
                                 loss_mask=expert_mask,
                                 loss_agg_mode=loss_agg_mode,
                             )
-                            policy_loss = policy_loss + expert_bc_coef * bc_loss
+                            weighted_bc = expert_bc_coef * bc_loss
+                            policy_loss = policy_loss + weighted_bc
                             bc_loss_val = float(bc_loss.detach().item())
+                            bc_weighted_val = float(weighted_bc.detach().item())
                             bc_scale_val = float(row_w.mean().item())
 
                     if self.config.use_dynamic_bsz:
@@ -390,7 +410,12 @@ class DataParallelPPOActor(BasePPOActor):
                         'actor/ppo_kl': ppo_kl.detach().item(),
                         'actor/pg_clipfrac_lower': pg_clipfrac_lower.detach().item(),
                         'actor/expert_bc_loss': bc_loss_val,
+                        'actor/expert_bc_weighted': bc_weighted_val,
                         'actor/expert_bc_row_w_mean': bc_scale_val,
+                        'actor/expert_bc_n_tokens': bc_n_tokens,
+                        'actor/expert_bc_n_samples': bc_n_samples,
+                        'actor/expert_bc_n_high': bc_n_high,
+                        'actor/expert_bc_n_light': bc_n_light,
                     }
                     append_to_dict(metrics, data)
 

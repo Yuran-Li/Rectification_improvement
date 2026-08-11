@@ -1336,19 +1336,20 @@ class RayPPOTrainer(object):
                                     values_f=batch.batch['values_f'],
                                     multiturn_mask=route,
                                     window_valid=wv,
+                                    cost_budget=self.cost_budget,
                                 )
                                 metrics.update(audit)
                                 if int(self.global_steps) % 10 == 0:
                                     print(
                                         "[vf_audit] "
                                         f"P_c_f={audit['vf_audit/P_c_f']:.3f} "
-                                        f"P_target_pos={audit['vf_audit/P_target_pos']:.4f} "
                                         f"E_target={audit['vf_audit/E_target']:.4f} "
-                                        f"E_target|c>0={audit['vf_audit/E_target_at_c_pos']:.4f} "
-                                        f"fail_seqmean={audit['vf_audit/E_target_fail_seqmean']:.4f} "
-                                        f"n_route_mask_tokens={route.float().sum().item():.0f} "
-                                        f"P_G_seg={audit['vf_audit/P_G_at_seg_end']:.3f} "
-                                        f"E_tgt|G1={audit['vf_audit/E_target_at_seg_end_G1']:.4f}"
+                                        f"E_vf={audit['vf_audit/E_vf']:.4f} "
+                                        f"E_vf|G>0={audit['vf_audit/E_vf_at_G_pos']:.4f} "
+                                        f"E_vf|G=0={audit['vf_audit/E_vf_at_G_zero']:.4f} "
+                                        f"gap={audit['vf_audit/E_vf_G_gap']:.4f} "
+                                        f"P(c|V>B)={audit['vf_audit/P_c_given_vf_above_B']:.3f} "
+                                        f"P(c|V≤B)={audit['vf_audit/P_c_given_vf_at_or_below_B']:.3f}"
                                     )
 
                         # Feasibility gate + expert buffer for BC

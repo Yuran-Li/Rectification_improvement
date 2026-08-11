@@ -172,7 +172,10 @@ class vLLMPAGRollout(vLLMRollout):
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_prefix_caching=True,
+            # Prefix caching + sleep/free_cache_engine has caused
+            # "Failed to reset prefix cache... blocks not freed" then
+            # CUDA illegal memory access during sampling after ~10–20 steps.
+            enable_prefix_caching=False,
             trust_remote_code=kwargs.get('trust_remote_code', False),
             seed=42,
         )

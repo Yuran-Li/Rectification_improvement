@@ -781,14 +781,19 @@ def compute_vf_target_audit(
     values_f: torch.Tensor,
     multiturn_mask: torch.Tensor,
     window_valid: Optional[np.ndarray] = None,
+    cost_budget: Optional[float] = None,
     eps: float = 1e-6,
 ) -> Dict[str, float]:
-    """Audit what the failure critic actually regresses onto (token-level).
+    """Audit what the failure critic actually regresses onto.
 
-    Compares sample-level P(c^F=1) with the distribution of ``returns_f`` under the
-    same ``multiturn_mask`` used by ``compute_value_loss``. If failure rate is ~30%
-    but E[returns_f|mask] and P(returns_f>0|mask) are near 0, the VF target is being
-    diluted / misaligned — not a "sparse failure" data problem.
+    When ``multiturn_mask`` is ``feasibility_mask`` (answer routing states),
+    ``returns_f`` is turn-level ``G_F`` and the key checks are:
+
+    - ``E_target ≈ G_F_mean`` (no token dilution)
+    - ``E[V_F | G_F>0] > E[V_F | G_F=0]`` (routing separability)
+    - optional ``P(c^F=1 | V_F>B_F) > P(c^F=1 | V_F≤B_F)`` (gate calibration)
+
+    Legacy ``E_*_at_c_pos`` keys still condition on cost tokens (dilution debug only).
     """
     mt = multiturn_mask.bool()
     c = costs.float()
@@ -806,6 +811,12 @@ def compute_vf_target_audit(
             'vf_audit/P_c_f': 0.0,
             'vf_audit/P_target_pos': 0.0,
             'vf_audit/E_target': 0.0,
+            'vf_audit/E_vf_at_G_pos': 0.0,
+            'vf_audit/E_vf_at_G_zero': 0.0,
+            'vf_audit/E_vf_G_gap': 0.0,
+            'vf_audit/P_c_given_vf_above_B': 0.0,
+            'vf_audit/P_c_given_vf_at_or_below_B': 0.0,
+            'vf_audit/P_c_gate_gap': 0.0,
         }
 
     # per-sample episode cost (same as J_F construction)
@@ -847,6 +858,49 @@ def compute_vf_target_audit(
     else:
         e_tgt_at_zero_c = 0.0
         e_vf_at_zero_c = 0.0
+
+    # Routing-state separability: condition on G_F (=target on feasibility_mask), NOT cost tokens.
+    g_pos = row_mt & (tgt > eps)
+    g_zero = row_mt & (tgt <= eps)
+    if g_pos.any():
+        e_tgt_at_g_pos = tgt[g_pos].mean().item()
+        e_vf_at_g_pos = vf[g_pos].mean().item()
+        n_g_pos = float(g_pos.sum().item())
+    else:
+        e_tgt_at_g_pos = 0.0
+        e_vf_at_g_pos = 0.0
+        n_g_pos = 0.0
+    if g_zero.any():
+        e_tgt_at_g_zero = tgt[g_zero].mean().item()
+        e_vf_at_g_zero = vf[g_zero].mean().item()
+        n_g_zero = float(g_zero.sum().item())
+    else:
+        e_tgt_at_g_zero = 0.0
+        e_vf_at_g_zero = 0.0
+        n_g_zero = 0.0
+    e_vf_g_gap = e_vf_at_g_pos - e_vf_at_g_zero
+
+    # Gate calibration (sample-level): P(c^F=1 | V_F_state ? B_F)
+    # V_F_state = mean V_F on routing mask positions (same as feas_gate).
+    p_c_above_b = 0.0
+    p_c_below_b = 0.0
+    p_c_gate_gap = 0.0
+    n_above_b = 0.0
+    n_below_b = 0.0
+    if cost_budget is not None:
+        route_cnt = mt.float().sum(dim=-1).clamp(min=1.0)
+        v_f_state = (vf * mt.float()).sum(dim=-1) / route_cnt
+        no_route = mt.float().sum(dim=-1) == 0
+        v_f_state = torch.where(no_route, torch.zeros_like(v_f_state), v_f_state)
+        above = valid & (~no_route) & (v_f_state > float(cost_budget))
+        below = valid & (~no_route) & (v_f_state <= float(cost_budget))
+        n_above_b = float(above.sum().item())
+        n_below_b = float(below.sum().item())
+        if above.any():
+            p_c_above_b = sample_fail[above].float().mean().item()
+        if below.any():
+            p_c_below_b = sample_fail[below].float().mean().item()
+        p_c_gate_gap = p_c_above_b - p_c_below_b
 
     # Dilution proxy: on failing samples, mean token target under multiturn vs at cost tokens
     fail_rows = sample_fail & valid
@@ -929,6 +983,20 @@ def compute_vf_target_audit(
         'vf_audit/E_vf': float(e_vf),
         'vf_audit/E_vf_at_c_pos': float(e_vf_at_c),
         'vf_audit/E_vf_at_zero_c': float(e_vf_at_zero_c),
+        # Routing G_F conditioning (use these for separability checks)
+        'vf_audit/E_target_at_G_pos': float(e_tgt_at_g_pos),
+        'vf_audit/E_target_at_G_zero': float(e_tgt_at_g_zero),
+        'vf_audit/E_vf_at_G_pos': float(e_vf_at_g_pos),
+        'vf_audit/E_vf_at_G_zero': float(e_vf_at_g_zero),
+        'vf_audit/E_vf_G_gap': float(e_vf_g_gap),
+        'vf_audit/n_routing_G_pos': float(n_g_pos),
+        'vf_audit/n_routing_G_zero': float(n_g_zero),
+        # Gate calibration vs B_F (0 if cost_budget not passed)
+        'vf_audit/P_c_given_vf_above_B': float(p_c_above_b),
+        'vf_audit/P_c_given_vf_at_or_below_B': float(p_c_below_b),
+        'vf_audit/P_c_gate_gap': float(p_c_gate_gap),
+        'vf_audit/n_vf_above_B': float(n_above_b),
+        'vf_audit/n_vf_at_or_below_B': float(n_below_b),
         'vf_audit/mask_coverage_on_c_pos': float(mask_cov_on_cf),
         'vf_audit/E_target_fail_seqmean': float(e_tgt_fail_seqmean),
         'vf_audit/mean_multiturn_len_fail': float(L),
