@@ -667,6 +667,10 @@ def compute_all_turn_event_metrics(infos_dict: dict[str, list[Any]]) -> dict[str
     For each window_valid row:
       - one verify event on y_w (acc_t1 vs genrm)
       - if acc_t2 >= 0, one rectify event y_w -> y_{w+1}
+
+    TPR/TNR match paper & SFT (v=1 means verify says wrong):
+      TPR = P(v=1 | a=0) error recall
+      TNR = P(v=0 | a=1) correct-answer retention
     """
     n = len(infos_dict.get('acc_t1', infos_dict.get('acc', [])))
     if n == 0:
@@ -679,11 +683,17 @@ def compute_all_turn_event_metrics(infos_dict: dict[str, list[Any]]) -> dict[str
     genrm_pred = infos_dict.get('genrm_pred', ['none'] * n)
 
     # --- all verifies ---
-    # Standard confusion (verify predicts "correct"):
+    # Intermediate counts use "predict correct" confusion:
     #   TP: said correct, was correct
     #   FN: said wrong,   was correct
     #   TN: said wrong,   was wrong
     #   FP: said correct, was wrong
+    #
+    # Paper / SFT definitions (v=1 means verify says wrong):
+    #   TPR = P(v=1 | a=0) = TN/(TN+FP)  error recall
+    #   TNR = P(v=0 | a=1) = TP/(TP+FN)  correct-answer retention
+    # Logged verify_TP/FN stay standard; verify_FP/TN keep legacy PAG aliases
+    # (FP:=said wrong & wrong, TN:=said correct & wrong) for old dashboards.
     TP = FP = FN = TN = 0
     n_verify = 0
     for i in range(n):
@@ -708,30 +718,26 @@ def compute_all_turn_event_metrics(infos_dict: dict[str, list[Any]]) -> dict[str
         else:
             FN += 1
 
-    tpr = TP / (TP + FN) if (TP + FN) else 0.0
-    tnr = TN / (TN + FP) if (TN + FP) else 0.0
-    # legacy pag-style aliases (note: old FP/TN naming was swapped vs standard)
-    legacy_FP = TN  # said wrong & was wrong
-    legacy_TN = FP  # said correct & was wrong
+    tpr = TN / (TN + FP) if (TN + FP) else 0.0  # paper: error recall
+    tnr = TP / (TP + FN) if (TP + FN) else 0.0  # paper: correct retention
+    # legacy pag-style aliases for raw counts only (FP:=said wrong & wrong)
+    legacy_FP = TN
+    legacy_TN = FP
     metrics = {
         'n_verify': float(n_verify),
         'verify_TP': TP,
         'verify_FP': legacy_FP,
         'verify_FN': FN,
         'verify_TN': legacy_TN,
-        'TPR': tpr,
-        'TNR': tnr,
-        'verify_recall': tpr,
-        'verify_recall_negative': tnr,
-        'verify_precision': TP / (TP + FP) if (TP + FP) else 0.0,
-        'verify_f1': (2 * TP / (2 * TP + FP + FN)) if (2 * TP + FP + FN) else 0.0,
+        # Paper / SFT (v=1 means verify says wrong)
+        'TPR': tpr,  # P(v=1 | a=0)
+        'TNR': tnr,  # P(v=0 | a=1)
     }
 
-    # --- all rectifies ---
-    # ECR_TP: I→C count; EIR_FP: C→I count
-    ecr_tp = eir_fp = 0
+    # --- all rectifies (window had a follow-up answer ⇒ repair was triggered) ---
+    # Paper: ECR_TP = P(a2=1 | a1=0, v=1), EIR_FP = P(a2=0 | a1=1, v=1)
+    n_ecr_tp = n_eir_fp = 0
     n_rect = n_prev_wrong = n_prev_correct = 0
-    i_to_c = c_to_i = c_to_c = i_to_i = 0
     for i in range(n):
         if not bool(window_valid[i]):
             continue
@@ -745,32 +751,27 @@ def compute_all_turn_event_metrics(infos_dict: dict[str, list[Any]]) -> dict[str
         if not prev_ok:
             n_prev_wrong += 1
             if cur_ok:
-                ecr_tp += 1
-                i_to_c += 1
-            else:
-                i_to_i += 1
+                n_ecr_tp += 1
         else:
             n_prev_correct += 1
             if not cur_ok:
-                eir_fp += 1
-                c_to_i += 1
-            else:
-                c_to_c += 1
+                n_eir_fp += 1
 
-    ecr = ecr_tp / n_prev_wrong if n_prev_wrong else 0.0
-    eir = eir_fp / n_prev_correct if n_prev_correct else 0.0
+    ecr_tp = n_ecr_tp / n_prev_wrong if n_prev_wrong else 0.0
+    eir_fp = n_eir_fp / n_prev_correct if n_prev_correct else 0.0
+    # Population mass (= PAG i_to_c_rate_gt / c_to_i_rate_gt): count / all rows
+    n_all = float(n)
     metrics.update({
         'n_rectify': float(n_rect),
-        'ECR_TP': ecr_tp,
-        'EIR_FP': eir_fp,
-        'ECR': ecr,
-        'EIR': eir,
-        'i_to_c_rate': ecr,
-        'c_to_i_rate': eir,
-        'i_to_c_count': i_to_c,
-        'c_to_i_count': c_to_i,
-        'i_to_i_count': i_to_i,
-        'c_to_c_count': c_to_c,
+        # rates (paper); *_count / *_mass for absolute harm/benefit
+        'ECR_TP': ecr_tp,  # P(a2=1 | a1=0, v=1)  ≈ PAG i_to_c_rate
+        'EIR_FP': eir_fp,  # P(a2=0 | a1=1, v=1)  ≈ PAG c_to_i_rate
+        'ECR_TP_count': float(n_ecr_tp),
+        'EIR_FP_count': float(n_eir_fp),
+        'ECR_TP_mass': float(n_ecr_tp) / n_all if n_all > 0 else 0.0,
+        'EIR_FP_mass': float(n_eir_fp) / n_all if n_all > 0 else 0.0,  # ≈ c_to_i_rate_gt
+        'n_rectify_from_wrong': float(n_prev_wrong),
+        'n_rectify_from_correct': float(n_prev_correct),
     })
     return metrics
 
@@ -1013,7 +1014,11 @@ def compute_vf_target_audit(
 def compute_trajectory_val_metrics(infos_dict: dict[str, list[Any]]) -> dict[str, float]:
     """Per-trajectory validation metrics (equal weight per sample, not per window).
 
-    Verify/rectify event rates are NOT computed here — use
+    End-to-end:
+      W2C = P(a_final=1 | a1=0), C2W = P(a_final=0 | a1=1)
+      W2C_mass / C2W_mass = count / n_traj  (= PAG i_to_c_rate_gt / c_to_i_rate_gt)
+
+    Verify/rectify conditional rates (TPR/TNR/ECR_TP/EIR_FP) come from
     ``compute_all_turn_event_metrics`` on pre-collapse window rows.
     """
     acc = np.asarray(infos_dict.get('acc_final', infos_dict.get('acc', [])), dtype=np.float64)
@@ -1027,15 +1032,30 @@ def compute_trajectory_val_metrics(infos_dict: dict[str, list[Any]]) -> dict[str
     revised = np.asarray(infos_dict.get('revised', [False] * len(acc)), dtype=bool)
 
     correct = acc >= 0.5
+    a1_ok = y0 >= 0.5
+    a1_bad = ~a1_ok
+    # End-to-end system outcomes (not conditioned on verify/revise)
+    n_wrong = float(a1_bad.sum())
+    n_correct = float(a1_ok.sum())
+    n_w2c = float((correct & a1_bad).sum())
+    n_c2w = float((~correct & a1_ok).sum())
+    n_traj = float(len(acc))
+    w2c = n_w2c / n_wrong if n_wrong > 0 else 0.0
+    c2w = n_c2w / n_correct if n_correct > 0 else 0.0
     metrics = {
         'final_acc': float(acc.mean()),
         'turn1_acc': float(y0.mean()),
+        'W2C': w2c,  # P(a_final=1 | a1=0)
+        'C2W': c2w,  # P(a_final=0 | a1=1)
+        # Absolute mass over all trajs (= PAG c_to_i_rate_gt / i_to_c_rate_gt)
+        'W2C_mass': n_w2c / n_traj if n_traj > 0 else 0.0,
+        'C2W_mass': n_c2w / n_traj if n_traj > 0 else 0.0,
         'mean_turns': float(turns.mean()),
         'mean_turns_correct': float(turns[correct].mean()) if correct.any() else 0.0,
         'mean_turns_incorrect': float(turns[~correct].mean()) if (~correct).any() else 0.0,
         'early_stop_rate': float((turns <= 1).mean()),
         'revised_rate': float(revised.mean()),
-        'n_traj': float(len(acc)),
+        'n_traj': n_traj,
     }
     if 'c_ver' in infos_dict:
         metrics['c_ver_rate'] = float(np.mean(infos_dict['c_ver']))

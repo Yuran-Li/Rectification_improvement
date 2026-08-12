@@ -22,6 +22,29 @@ from collections import defaultdict
 from typing import List, Dict, Any
 
 
+def _jsonable(x: Any) -> Any:
+    """Convert numpy / torch scalars so json.dump does not fail on float32."""
+    try:
+        import numpy as np
+        if isinstance(x, np.generic):
+            return x.item()
+        if isinstance(x, np.ndarray):
+            return x.tolist()
+    except Exception:
+        pass
+    try:
+        import torch
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().tolist() if x.ndim else x.detach().cpu().item()
+    except Exception:
+        pass
+    if isinstance(x, (list, tuple)):
+        return [_jsonable(v) for v in x]
+    if isinstance(x, dict):
+        return {k: _jsonable(v) for k, v in x.items()}
+    return x
+
+
 def save_validation_results_to_json(data_sources: List[str],
                                     sample_inputs: List[str],
                                     infos_dict: Dict[str, List[Any]],
@@ -55,29 +78,29 @@ def save_validation_results_to_json(data_sources: List[str],
             if sample_idx < len(var_vals):
                 # 存储所有感兴趣的字段到JSON
                 if var_name == "reward":
-                    sample_data["score"] = var_vals[sample_idx]
+                    sample_data["score"] = _jsonable(var_vals[sample_idx])
                 elif var_name == "pred":
-                    sample_data["prediction"] = var_vals[sample_idx]
+                    sample_data["prediction"] = _jsonable(var_vals[sample_idx])
                 elif var_name == "genrm_pred":
-                    sample_data["genrm_prediction"] = var_vals[sample_idx]
+                    sample_data["genrm_prediction"] = _jsonable(var_vals[sample_idx])
                 elif var_name == "acc":
                     sample_data["is_correct"] = bool(var_vals[sample_idx] >= 0.5)
                 elif var_name == "ground_truth":
-                    sample_data["ground_truth"] = var_vals[sample_idx]
+                    sample_data["ground_truth"] = _jsonable(var_vals[sample_idx])
                 elif var_name == "response":
-                    sample_data["response"] = var_vals[sample_idx]
+                    sample_data["response"] = _jsonable(var_vals[sample_idx])
                 elif var_name == "genrm_score":
-                    sample_data["genrm_score"] = var_vals[sample_idx]
+                    sample_data["genrm_score"] = _jsonable(var_vals[sample_idx])
                 elif var_name in (
                     "acc_t1", "acc_t2", "acc_final", "pred_t1", "pred_t2",
                     "revised", "final_turn", "ground_truth", "genrm_probs",
                     "data_source",
                 ):
-                    sample_data[var_name] = var_vals[sample_idx]
+                    sample_data[var_name] = _jsonable(var_vals[sample_idx])
         
         # 将样本数据添加到对应提示的列表中
         if sample_data:
-            json_results[data_source][prompt].append(sample_data)
+            json_results[data_source][prompt].append(_jsonable(sample_data))
 
     # 添加时间戳到文件名
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -95,7 +118,7 @@ def save_validation_results_to_json(data_sources: List[str],
     
     # 保存到文件
     with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(json_dict, f, ensure_ascii=False, indent=2)
+        json.dump(_jsonable(json_dict), f, ensure_ascii=False, indent=2)
     
     print(f"验证结果已保存到: {filename}")
     

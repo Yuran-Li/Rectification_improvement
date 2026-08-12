@@ -854,9 +854,12 @@ class RayPPOTrainer(object):
             f"val traj metrics (window_expand={val_window_expand}, "
             f"n_rows={len(sample_inputs)}, n_traj={len(traj_inputs)}): "
             f"final_acc={traj_metrics.get('final_acc')}, "
-            f"mean_turns={traj_metrics.get('mean_turns')}, "
+            f"turn1_acc={traj_metrics.get('turn1_acc')}, "
+            f"W2C={traj_metrics.get('W2C')}, C2W={traj_metrics.get('C2W')}, "
+            f"C2W_mass={traj_metrics.get('C2W_mass')}, "
             f"TPR={event_metrics.get('TPR')}, TNR={event_metrics.get('TNR')}, "
-            f"ECR={event_metrics.get('ECR')}, EIR={event_metrics.get('EIR')}, "
+            f"ECR_TP={event_metrics.get('ECR_TP')}, EIR_FP={event_metrics.get('EIR_FP')}, "
+            f"EIR_FP_mass={event_metrics.get('EIR_FP_mass')}, "
             f"n_verify={event_metrics.get('n_verify')}, n_rectify={event_metrics.get('n_rectify')}"
         )
         
@@ -864,12 +867,16 @@ class RayPPOTrainer(object):
         json_path = self.config.trainer.get('validation_results_path', 'validation_results.json')
         
         if save_validation_results:
-            saved_file = save_validation_results_to_json(
-                data_sources=traj_sources,
-                sample_inputs=traj_inputs,
-                infos_dict=traj_infos,
-                json_path=json_path
-            )
+            try:
+                saved_file = save_validation_results_to_json(
+                    data_sources=traj_sources,
+                    sample_inputs=traj_inputs,
+                    infos_dict=traj_infos,
+                    json_path=json_path
+                )
+            except Exception as e:
+                print(f"[validate] save_validation_results failed (metrics still valid): {e}")
+                saved_file = None
 
             import pickle
             import os

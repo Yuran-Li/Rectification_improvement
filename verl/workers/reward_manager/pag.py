@@ -576,6 +576,7 @@ class PAGRewardManager:
             turn1_policy = turn_acc[:, 0]
             turn1_verify = verify_acc[:, 0]
             TP = ((turn1_verify > 0.5) & (turn1_policy > 0.5)).sum().item()
+            # PAG legacy names (not sklearn): FP = reject & wrong, TN = accept & wrong
             FP = ((turn1_verify <= 0.5) & (turn1_policy <= 0.5)).sum().item()
             FN = ((turn1_verify <= 0.5) & (turn1_policy > 0.5)).sum().item()
             TN = ((turn1_verify > 0.5) & (turn1_policy <= 0.5)).sum().item()
@@ -583,36 +584,37 @@ class PAGRewardManager:
             metrics[f'{prefix}verify_FP'] = FP
             metrics[f'{prefix}verify_FN'] = FN
             metrics[f'{prefix}verify_TN'] = TN
-            precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
-            recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
-            recall_neg = TN / (TN + FP) if (TN + FP) > 0 else 0.0
-            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+            # Paper: TPR=P(v=1|a=0)=FP/(FP+TN), TNR=P(v=0|a=1)=TP/(TP+FN)
+            # (PAG legacy: FP:=reject&wrong, TN:=accept&wrong)
+            tnr = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+            tpr = FP / (FP + TN) if (FP + TN) > 0 else 0.0
             metrics.update({
-                f'{prefix}verify_precision': precision,
-                f'{prefix}verify_recall': recall,
-                f'{prefix}verify_recall_negative': recall_neg,
-                f'{prefix}verify_f1': f1,
+                f'{prefix}TPR': tpr,
+                f'{prefix}TNR': tnr,
             })
             if turn_acc.shape[1] > 1:
                 turn2_mask = (turn_counts == 2)
                 if turn2_mask.any():
                     turn2_policy = turn_acc[:, 1][turn2_mask]
                     turn1_policy_masked = turn1_policy[turn2_mask]
-                    i_to_c = ((turn2_policy > 0.5) & (turn1_policy_masked <= 0.5)).sum().item()
-                    c_to_i = ((turn2_policy <= 0.5) & (turn1_policy_masked > 0.5)).sum().item()
-                    total_incorrect = (turn1_policy_masked <= 0.5).sum().item()
-                    total_correct = (turn1_policy_masked > 0.5).sum().item()
-                    if total_incorrect > 0:
+                    # ECR_TP / EIR_FP: rates given repair was triggered (turn2 exists)
+                    # *_mass: count / all samples (= PAG i_to_c_rate_gt / c_to_i_rate_gt)
+                    ecr_n = ((turn2_policy > 0.5) & (turn1_policy_masked <= 0.5)).sum().item()
+                    eir_n = ((turn2_policy <= 0.5) & (turn1_policy_masked > 0.5)).sum().item()
+                    n_from_wrong = (turn1_policy_masked <= 0.5).sum().item()
+                    n_from_correct = (turn1_policy_masked > 0.5).sum().item()
+                    n_all = len(turn1_policy)
+                    if n_from_wrong > 0:
                         metrics.update({
-                            f'{prefix}i_to_c_rate': i_to_c / total_incorrect,
-                            f'{prefix}i_to_c_rate_gt': i_to_c / len(turn1_policy),
-                            f'{prefix}i_to_c_count': i_to_c,
+                            f'{prefix}ECR_TP': ecr_n / n_from_wrong,
+                            f'{prefix}ECR_TP_count': ecr_n,
+                            f'{prefix}ECR_TP_mass': ecr_n / n_all,
                         })
-                    if total_correct > 0:
+                    if n_from_correct > 0:
                         metrics.update({
-                            f'{prefix}c_to_i_rate': c_to_i / total_correct,
-                            f'{prefix}c_to_i_rate_gt': c_to_i / len(turn1_policy),
-                            f'{prefix}c_to_i_count': c_to_i,
+                            f'{prefix}EIR_FP': eir_n / n_from_correct,
+                            f'{prefix}EIR_FP_count': eir_n,
+                            f'{prefix}EIR_FP_mass': eir_n / n_all,  # PAG c_to_i_rate_gt
                         })
         return metrics
 
