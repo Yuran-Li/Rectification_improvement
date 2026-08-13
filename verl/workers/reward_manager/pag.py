@@ -30,11 +30,16 @@ class PAGRewardManager:
       R_gen = 1[y0 correct]
       R_rect = hat_R(y_i) + alpha * (hat_R(y_i) - hat_R(y_{i-1}))
       R_ver  = hat_R_v + beta * (hat_R(y_i) - hat_R(y_{i-1}))   # utility after rectify
-      Also logs c^ver / c^rect / c^F feasibility costs.
-      Token costs are role-aligned (event markers only): c^ver @ verify end, c^rect @
-      rectify end. Per correction turn: c_i^F = 1[c_i^ver ∨ c_i^rect].
-      Turn-level cost-to-go G_{F,k} = Σ_{j≥k} γ_F^{j-k} c_{j+1}^F is written at answer
-      routing states (after each y_k); VF trains only there — not on every token.
+      Also logs c^ver / c^rect / c^F event costs for Lagrangian.
+      Role-aware state-level feasibility (frozen target definition):
+        Decision states: s^V @ answer end, s^R @ verify end (before rectify).
+        Under slide_window=False (default full-concat), observation s is the causal
+        prefix up to that boundary (may include earlier turns).
+        V_F^π(s)=P_π(z_final=0|s),  G_F(s)=1[z_final=0]
+        where z_final=1 iff the trajectory's **final answer** is correct (else 0).
+        Failure = final answer wrong — not “ever failed” / not role-error events.
+        Gate F(s)=V_F(s)-ε; F(s^V)>ε → expert verify BC; F(s^R)>ε → expert rectify BC.
+      VF trains only at role decision boundaries — not on every token.
     """
 
     def __init__(self, tokenizer, num_examine, config=None):
@@ -69,29 +74,79 @@ class PAGRewardManager:
         return ends.tolist()
 
     @staticmethod
+    def z_final_correct(answer_accs: List[float]) -> float:
+        """z_final=1 if trajectory final answer is correct, else 0."""
+        if not answer_accs:
+            return 0.0
+        return 1.0 if float(answer_accs[-1]) >= 0.5 else 0.0
+
+    @staticmethod
+    def g_f_from_final_answer(answer_accs: List[float]) -> float:
+        """Frozen G_F(s)=1[z_final=0] for any decision state on this trajectory.
+
+        Same scalar for every s^V / s^R on the traj: depends only on the final answer,
+        not on intermediate role errors or “ever wrong”.
+        """
+        return 1.0 - PAGRewardManager.z_final_correct(answer_accs)
+
+    @staticmethod
+    def eventual_fail_at_answer(answer_accs: List[float], k: int = 0) -> float:
+        """Alias: G_F at s^V (ignores k; final-answer definition)."""
+        del k
+        return PAGRewardManager.g_f_from_final_answer(answer_accs)
+
+    @staticmethod
+    def eventual_fail_at_rectify(answer_accs: List[float], y_i_idx: int = 0) -> float:
+        """Alias: G_F at s^R (ignores y_i_idx; final-answer definition)."""
+        del y_i_idx
+        return PAGRewardManager.g_f_from_final_answer(answer_accs)
+
+    @staticmethod
+    def recovery_failure_from_accs(answer_accs: List[float]) -> List[float]:
+        """Per-answer-end G_F list (each equals 1[z_final=0])."""
+        g = PAGRewardManager.g_f_from_final_answer(answer_accs)
+        return [g for _ in answer_accs]
+
+    @staticmethod
+    def traj_self_correction_fail(answer_accs: List[float]) -> float:
+        """Same as G_F under final-answer definition."""
+        return PAGRewardManager.g_f_from_final_answer(answer_accs)
+
+    @staticmethod
     def _fill_routing_targets(
         feasibility_mask: torch.Tensor,
         feasibility_returns: torch.Tensor,
         row: int,
         answer_ends: List[int],
-        turn_costs: List[float],
-        gamma_f: float,
+        answer_accs: List[float],
+        gamma_f: float = 1.0,  # unused; kept for call-site compat
+        feasibility_mask_v: Optional[torch.Tensor] = None,
+        feasibility_mask_r: Optional[torch.Tensor] = None,
+        rectify_states: Optional[List[Tuple[int, int]]] = None,
     ) -> None:
-        """Write G_{F,k} at answer routing token positions.
+        """Write G_F=1[z_final=0] at s^V (answer ends) and s^R (verify ends).
 
-        answer_ends[k] = token index of y_k end (state s_k).
-        turn_costs[j] = c_{j+1}^F for correction round j+1.
-        G_{F,k} = Σ_{j≥k} γ_F^{j-k} turn_costs[j].
+        s^V=(x,y_i), s^R=(x,y_i,v_i). All decision states on one traj share the
+        same target from the trajectory final answer.
         """
+        del gamma_f
+        g = PAGRewardManager.g_f_from_final_answer(answer_accs)
         L = feasibility_mask.shape[-1]
-        for k, aend in enumerate(answer_ends):
+        for aend in answer_ends:
             if aend < 0 or aend >= L:
                 continue
-            g = 0.0
-            for j in range(k, len(turn_costs)):
-                g += (gamma_f ** (j - k)) * float(turn_costs[j])
             feasibility_mask[row, aend] = True
-            feasibility_returns[row, aend] = g
+            feasibility_returns[row, aend] = float(g)
+            if feasibility_mask_v is not None:
+                feasibility_mask_v[row, aend] = True
+        if rectify_states:
+            for vend, _y_i_idx in rectify_states:
+                if vend < 0 or vend >= L:
+                    continue
+                feasibility_mask[row, vend] = True
+                feasibility_returns[row, vend] = float(g)
+                if feasibility_mask_r is not None:
+                    feasibility_mask_r[row, vend] = True
 
     def __call__(self, data: DataProto, return_dict: bool = False) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Compute rewards for multi-turn dialogue."""
@@ -106,11 +161,15 @@ class PAGRewardManager:
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
         # Event markers only (c^ver / c^rect at role ends); not VF regression targets
         cost_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
-        # Answer routing states: VF learns turn-level cost-to-go G_F here
+        # Role decision states: s^V @ answer ends, s^R @ verify ends (before rectify)
         feasibility_mask = torch.zeros_like(data.batch['responses'], dtype=torch.bool)
         feasibility_returns = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
-        # tokens to imitate when using expert BC (successful verify+rectify spans)
+        feasibility_mask_v = torch.zeros_like(data.batch['responses'], dtype=torch.bool)
+        feasibility_mask_r = torch.zeros_like(data.batch['responses'], dtype=torch.bool)
+        # Expert BC spans by role (union kept as expert_token_mask)
         expert_token_mask = torch.zeros_like(data.batch['responses'], dtype=torch.bool)
+        expert_token_mask_v = torch.zeros_like(data.batch['responses'], dtype=torch.bool)
+        expert_token_mask_r = torch.zeros_like(data.batch['responses'], dtype=torch.bool)
         metrics_tensors = {
             'turn_accuracies': torch.zeros((batch_size, self.max_turns), dtype=torch.float32, device=device),
             'verify_accuracies': torch.zeros((batch_size, self.max_turns), dtype=torch.float32, device=device),
@@ -221,9 +280,11 @@ class PAGRewardManager:
             c_rect_i = 0.0
             c_f_i = 0.0
             expert_bootstrap = False
-            # Correction-turn costs c_1^F, c_2^F, ... and answer-end token indices for G_F
+            # Answer / verify routing for V_F
             answer_ends: List[int] = []
-            turn_costs: List[float] = []
+            answer_accs: List[float] = []
+            rectify_states: List[Tuple[int, int]] = []  # (verify_end, y_i_idx)
+            turn_costs: List[float] = []  # legacy event costs (logging)
 
             # --- Score first model segment (y or verify if context-only answer) ---
             # With slide_window packing:
@@ -307,8 +368,13 @@ class PAGRewardManager:
                     if d_i == 0 and cur_acc < 0.5:
                         c_rect_i = 1.0
                     if verify_result["genrm_score"] >= 0.5 and d_i == 0 and cur_acc >= 0.5:
+                        # True reject + successful I→C: role-aware expert spans
                         expert_bootstrap = True
-                        expert_token_mask[i, verify_end:policy_end] = multiturn_mask[verify_end:policy_end]
+                        expert_token_mask_v[i, :verify_end] |= multiturn_mask[:verify_end]
+                        expert_token_mask_r[i, verify_end:policy_end] |= multiturn_mask[
+                            verify_end:policy_end
+                        ]
+                        expert_token_mask[i] |= expert_token_mask_v[i] | expert_token_mask_r[i]
 
                     u_v = cur_acc - prev_acc
                 else:
@@ -325,18 +391,27 @@ class PAGRewardManager:
                 if revised and c_rect_i > 0:
                     cost_tensor[i, policy_end - 1] = c_rect_i
                 c_f_i = 1.0 if (c_ver_i > 0 or c_rect_i > 0) else 0.0
-                # Routing state at context answer end (may be outside multiturn_mask)
+                # s^V=(x,y_w) at context answer end — packed prefix is question+latest answer only
                 if context_answer_len > 0:
                     answer_ends.append(context_answer_len - 1)
                 else:
                     answer_ends.append(max(deferred_verify_end - 1, 0))
+                answer_accs.append(prev_acc)
                 turn_costs.append(c_f_i)
                 if revised:
-                    answer_ends.append(policy_end - 1)
+                    # s^R=(x,y_w,v_w) at verify end (before rectify)
+                    rectify_states.append((deferred_verify_end - 1, 0))
+                    answer_accs.append(cur_acc)
+                    # Do NOT place s^V on y_{w+1} in this same packed row: causal prefix still
+                    # contains y_w/v_w, which is not Markov obs (x,y_{w+1}). That s^V lives in
+                    # window w+1 (as context answer) when verified; if never verified, G_F still
+                    # labels s^V@y_w / s^R via answer_accs final.
                 metrics_tensors['c_f_discounted'][i] += (self.gamma_f ** window_index) * c_f_i
 
             else:
                 # Standard path: first segment is y0 (or y_w with loss)
+                # slide_window pack sets window_index even on w==0
+                slide_packed = 'window_index' in ntb
                 first_result = get_policy_score(solution_str=first_response, ground_truth=ground_truth)
                 reward_extra_info["pred"].append(first_result["pred"])
                 reward_extra_info["acc"].append(first_result["acc"])
@@ -348,7 +423,8 @@ class PAGRewardManager:
                 reward_tensor[i, turn_boundaries[0] - 1] = first_result["acc"]
                 metrics_tensors['turn_accuracies'][i, 0] = first_result["acc"] >= 0.5
                 sample_answers.append(first_result['pred'])
-                answer_ends.append(turn_boundaries[0] - 1)  # routing state s_0 after y0
+                answer_ends.append(turn_boundaries[0] - 1)  # s^V after y0
+                answer_accs.append(float(first_result["acc"]))
 
                 gt_judge = first_result["acc"] >= 0.5
                 prev_acc = float(first_result["acc"])
@@ -432,11 +508,24 @@ class PAGRewardManager:
                     step_c_f = 1.0 if (step_c_ver > 0 or step_c_rect > 0) else 0.0
                     c_f_i = max(c_f_i, step_c_f)
                     turn_costs.append(step_c_f)
-                    answer_ends.append(policy_end - 1)  # routing state after y_turn
+                    # s^R=(x,y_i,v_i) at verify end; y_i index is turn-1
+                    rectify_states.append((verify_end - 1, turn - 1))
+                    answer_accs.append(cur_acc)
+                    # Non-slide full traj: next s^V is after y_turn (prefix is true history).
+                    # Slide pack: skip — y_{w+1} s^V belongs to the next window's (x,y) obs.
+                    if not slide_packed:
+                        answer_ends.append(policy_end - 1)
                     metrics_tensors['c_f_discounted'][i] += (self.gamma_f ** (turn - 1)) * step_c_f
                     if verify_result["genrm_score"] >= 0.5 and d_i == 0 and cur_acc >= 0.5:
+                        # True reject + successful I→C: role-aware expert spans
                         expert_bootstrap = True
-                        expert_token_mask[i, policy_start:policy_end] = multiturn_mask[policy_start:policy_end]
+                        expert_token_mask_v[i, verify_start:verify_end] |= multiturn_mask[
+                            verify_start:verify_end
+                        ]
+                        expert_token_mask_r[i, policy_start:policy_end] |= multiturn_mask[
+                            policy_start:policy_end
+                        ]
+                        expert_token_mask[i] |= expert_token_mask_v[i] | expert_token_mask_r[i]
 
                     prev_acc = cur_acc
                     gt_judge = cur_acc >= 0.5
@@ -468,7 +557,15 @@ class PAGRewardManager:
             metrics_tensors['c_rect'][i] = c_rect_i
             metrics_tensors['c_f'][i] = c_f_i
             self._fill_routing_targets(
-                feasibility_mask, feasibility_returns, i, answer_ends, turn_costs, self.gamma_f
+                feasibility_mask,
+                feasibility_returns,
+                i,
+                answer_ends,
+                answer_accs,
+                self.gamma_f,
+                feasibility_mask_v=feasibility_mask_v,
+                feasibility_mask_r=feasibility_mask_r,
+                rectify_states=rectify_states,
             )
 
             acc_t1 = float(reward_extra_info["acc"][-1])
@@ -541,8 +638,12 @@ class PAGRewardManager:
                 "cost_tensor": cost_tensor,
                 "feasibility_mask": feasibility_mask,
                 "feasibility_returns": feasibility_returns,
+                "feasibility_mask_v": feasibility_mask_v,
+                "feasibility_mask_r": feasibility_mask_r,
                 "c_f_discounted": metrics_tensors['c_f_discounted'],
                 "expert_token_mask": expert_token_mask,
+                "expert_token_mask_v": expert_token_mask_v,
+                "expert_token_mask_r": expert_token_mask_r,
                 "reward_extra_info": reward_extra_info,
                 "metrics": metrics,
             }

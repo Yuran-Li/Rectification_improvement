@@ -52,6 +52,11 @@ from verl.trainer.ppo.metric_utils import (
     compute_all_turn_event_metrics,
     compute_vf_target_audit,
 )
+from verl.trainer.ppo.gate_metrics import compute_gate_sanity_metrics, format_gate_sanity
+from verl.trainer.ppo.bootstrap_metrics import (
+    bootstrap_coverage_from_batch,
+    format_bootstrap_coverage,
+)
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
@@ -244,8 +249,8 @@ def compute_advantage(data: DataProto,
         data.batch['returns'] = returns
         data.batch['advantages_r'] = advantages
 
-        # Dual critic: turn-level MC cost-to-go G_F at answer routing states (not token GAE).
-        # feasibility_returns[s_k] = Σ_{j≥k} γ_F^{j-k} c_{j+1}^F; VF/A_f only meaningful there.
+        # Dual critic: state-level MC G_i^F at answer routing states (single-sample).
+        # feasibility_returns[s_i] = 1[future self-correction fail from s_i]; VF only there.
         use_dual = (
             dual_critic
             and 'values_f' in data.batch.keys()
@@ -262,7 +267,9 @@ def compute_advantage(data: DataProto,
                 advantages_f = advantages_f * fm.float()
             data.batch['advantages_f'] = advantages_f
             data.batch['returns_f'] = returns_f
-            data.batch['advantages'] = advantages - float(lagrange_lambda) * advantages_f
+            # Global CMDP term only when λ>0; default path is state-level gate (λ=0).
+            if abs(float(lagrange_lambda)) > 0.0:
+                data.batch['advantages'] = advantages - float(lagrange_lambda) * advantages_f
         elif use_dual and 'token_level_costs' in data.batch.keys():
             # Legacy fallback: token-level cost GAE (should not run once feasibility_returns is set)
             gamma_f = gamma if cost_gamma is None else cost_gamma
@@ -277,7 +284,8 @@ def compute_advantage(data: DataProto,
             )
             data.batch['advantages_f'] = advantages_f
             data.batch['returns_f'] = returns_f
-            data.batch['advantages'] = advantages - float(lagrange_lambda) * advantages_f
+            if abs(float(lagrange_lambda)) > 0.0:
+                data.batch['advantages'] = advantages - float(lagrange_lambda) * advantages_f
     elif adv_estimator == AdvantageEstimator.GRPO:
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch['token_level_rewards'],
@@ -403,13 +411,23 @@ class RayPPOTrainer(object):
         else:
             raise NotImplementedError
 
-        # Lagrangian dual for feasibility constraint J_F <= B_F
+        # State-level feasibility critic: V_F(s)≈P(future fail|s) from on-policy G_i^F.
+        # F(s)=V_F(s)-ε gates recovery supervision. No per-state branching for training.
+        # Global CMDP Lagrangian is optional (default off).
         self.dual_critic = bool(self.config.algorithm.get('dual_critic', False))
+        self.use_lagrangian = bool(self.config.algorithm.get('use_lagrangian', False))
         self.lagrange_lambda = float(self.config.algorithm.get('lagrange_lambda_init', 0.0))
         self.lagrange_lr = float(self.config.algorithm.get('lagrange_lr', 1e-3))
-        self.cost_budget = float(self.config.algorithm.get('cost_budget', 0.3))
+        if not self.use_lagrangian:
+            self.lagrange_lambda = 0.0
+        self.cost_budget = float(
+            self.config.algorithm.get(
+                'feasibility_epsilon', self.config.algorithm.get('cost_budget', 0.3)
+            )
+        )
+        self.feasibility_epsilon = self.cost_budget
         self.cost_gamma = float(self.config.algorithm.get('cost_gamma', 0.9))
-        # Pure PPO for the first N steps (λ=0, no infeasible BC); V_F still trains.
+        # First N steps: no infeasible BC/GPT (and λ frozen if Lagrangian on). V_F still trains.
         self.constraint_warmup = int(self.config.algorithm.get('constraint_warmup', 50))
         # Phase-3: infeasible → expert BC
         self.expert_bc = bool(self.config.algorithm.get('expert_bc', False))
@@ -427,10 +445,17 @@ class RayPPOTrainer(object):
         self.online_gpt_num_workers = int(self.config.algorithm.get('online_gpt_num_workers', 4))
         self._online_gpt_client = None
         if self.dual_critic:
-            print(f"[feasibility] dual_critic=True λ={self.lagrange_lambda} "
-                  f"lr_λ={self.lagrange_lr} B_F={self.cost_budget} "
-                  f"cost_gae_γ={self.cost_gamma} "
-                  f"constraint_warmup={self.constraint_warmup}")
+            print(
+                f"[feasibility] dual_critic=True use_lagrangian={self.use_lagrangian} "
+                f"ε={self.feasibility_epsilon} "
+                f"(role-aware F(s^V)/F(s^R); V_F←G_F; no branch for train) "
+                f"gate_warmup={self.constraint_warmup}"
+                + (
+                    f" λ={self.lagrange_lambda} lr_λ={self.lagrange_lr}"
+                    if self.use_lagrangian
+                    else " (no global J_F≤ε)"
+                )
+            )
         if self.expert_bc:
             print(f"[feasibility] expert_bc=True buffer_cap={self.expert_buffer_capacity} "
                   f"bootstrap_same_uid={self.bootstrap_same_uid}")
@@ -443,35 +468,112 @@ class RayPPOTrainer(object):
         self._create_dataloader()
 
     def _constraint_active(self) -> bool:
-        """True once past constraint_warmup (cost Lagrangian + infeasible BC/GPT)."""
+        """True once past warmup (infeasible BC/GPT; optional Lagrangian ascent)."""
         return int(self.global_steps) >= int(self.constraint_warmup)
 
     def _compute_feasibility_gates(self, batch: DataProto) -> DataProto:
-        """Per-sample V_F at answer routing states, gate g=1[V_F<=B_F]."""
+        """Role-aware F(s)=V_F(s)-ε at s^V / s^R decision states.
+
+        Paper gate: g(s)=1[V_F(s)>ε] → PPO+BC; F≤0 → PPO only.
+        Stored feas_gate_* = 1[F<=0] = 1-g (legacy name: “feasible / skip BC”).
+        Legacy feas_gate=1 only if every present role is feasible (else 0 for BC/GPT).
+        Routing uses V_F(s), not oracle verify/rectify error events.
+        """
         if 'values_f' not in batch.batch:
             return batch
         vf = batch.batch['values_f']
+        eps = self.feasibility_epsilon
+        device = vf.device
+
+        def _role_vf(route_key: str):
+            if route_key not in batch.batch:
+                return None, None, None
+            route = batch.batch[route_key].bool()
+            has = route.any(dim=-1)
+            denom = route.float().sum(dim=-1).clamp(min=1.0)
+            v = (vf * route.float()).sum(dim=-1) / denom
+            v = torch.where(has, v, torch.zeros_like(v))
+            return v, (v <= eps).float(), (v - eps).clamp(min=0.0, max=1.0)
+
+        v_f_v, gate_v, weight_v = _role_vf('feasibility_mask_v')
+        v_f_r, gate_r, weight_r = _role_vf('feasibility_mask_r')
+
+        # Fallback: legacy single mask → treat as combined
+        if v_f_v is None and v_f_r is None:
+            if 'feasibility_mask' in batch.batch:
+                route = batch.batch['feasibility_mask'].bool()
+            elif 'multiturn_mask' in batch.batch:
+                route = batch.batch['multiturn_mask'].bool()
+            else:
+                return batch
+            denom = route.float().sum(dim=-1).clamp(min=1.0)
+            v_f_s = (vf * route.float()).sum(dim=-1) / denom
+            no_route = route.float().sum(dim=-1) == 0
+            v_f_s = torch.where(no_route, torch.zeros_like(v_f_s), v_f_s)
+            if 'window_valid' in batch.non_tensor_batch:
+                valid = torch.tensor(
+                    batch.non_tensor_batch['window_valid'].astype(np.bool_), device=device
+                )
+                v_f_s = torch.where(valid, v_f_s, torch.zeros_like(v_f_s))
+            batch.batch['feas_gate'] = (v_f_s <= eps).float()
+            batch.batch['feas_weight'] = (v_f_s - eps).clamp(min=0.0, max=1.0)
+            batch.batch['v_f_state'] = v_f_s
+            return batch
+
+        B = vf.size(0)
+        if v_f_v is None:
+            v_f_v = torch.zeros(B, device=device)
+            gate_v = torch.ones(B, device=device)
+            weight_v = torch.zeros(B, device=device)
+            has_v = torch.zeros(B, dtype=torch.bool, device=device)
+        else:
+            has_v = batch.batch['feasibility_mask_v'].bool().any(dim=-1)
+        if v_f_r is None:
+            v_f_r = torch.zeros(B, device=device)
+            gate_r = torch.ones(B, device=device)
+            weight_r = torch.zeros(B, device=device)
+            has_r = torch.zeros(B, dtype=torch.bool, device=device)
+        else:
+            has_r = batch.batch['feasibility_mask_r'].bool().any(dim=-1)
+
+        if 'window_valid' in batch.non_tensor_batch:
+            valid = torch.tensor(
+                batch.non_tensor_batch['window_valid'].astype(np.bool_), device=device
+            )
+            # invalid → treat roles as feasible
+            gate_v = torch.where(valid, gate_v, torch.ones_like(gate_v))
+            gate_r = torch.where(valid, gate_r, torch.ones_like(gate_r))
+            weight_v = torch.where(valid, weight_v, torch.zeros_like(weight_v))
+            weight_r = torch.where(valid, weight_r, torch.zeros_like(weight_r))
+            v_f_v = torch.where(valid, v_f_v, torch.zeros_like(v_f_v))
+            v_f_r = torch.where(valid, v_f_r, torch.zeros_like(v_f_r))
+
+        # Row feasible iff every present role is feasible
+        both_ok = torch.ones(B, device=device)
+        both_ok = torch.where(has_v, gate_v, both_ok)
+        both_ok = torch.where(has_r, torch.minimum(both_ok, gate_r), both_ok)
+        # weight: max F_+ over infeasible roles
+        w = torch.zeros(B, device=device)
+        w = torch.where(has_v & (gate_v < 0.5), torch.maximum(w, weight_v), w)
+        w = torch.where(has_r & (gate_r < 0.5), torch.maximum(w, weight_r), w)
+
+        # Combined V_F for logging: mean over all routing positions
         if 'feasibility_mask' in batch.batch:
             route = batch.batch['feasibility_mask'].bool()
-        elif 'multiturn_mask' in batch.batch:
-            # legacy fallback
-            mt = batch.batch['multiturn_mask'].bool()
-            route = mt
+            denom = route.float().sum(dim=-1).clamp(min=1.0)
+            v_f_s = (vf * route.float()).sum(dim=-1) / denom
+            v_f_s = torch.where(route.any(dim=-1), v_f_s, torch.zeros_like(v_f_s))
         else:
-            return batch
-        denom = route.float().sum(dim=-1).clamp(min=1.0)
-        v_f_s = (vf * route.float()).sum(dim=-1) / denom
-        no_route = route.float().sum(dim=-1) == 0
-        if no_route.any():
-            v_f_s = torch.where(no_route, torch.zeros_like(v_f_s), v_f_s)
-        if 'window_valid' in batch.non_tensor_batch:
-            valid = torch.tensor(batch.non_tensor_batch['window_valid'].astype(np.bool_), device=v_f_s.device)
-            # invalid windows: treat as feasible (no BC/PPO pressure)
-            v_f_s = torch.where(valid, v_f_s, torch.zeros_like(v_f_s))
-        feas_gate = (v_f_s <= self.cost_budget).float()
-        feas_weight = (v_f_s - self.cost_budget).clamp(min=0.0, max=1.0)
-        batch.batch['feas_gate'] = feas_gate
-        batch.batch['feas_weight'] = feas_weight
+            v_f_s = torch.maximum(v_f_v, v_f_r)
+
+        batch.batch['feas_gate_v'] = gate_v
+        batch.batch['feas_gate_r'] = gate_r
+        batch.batch['feas_weight_v'] = weight_v
+        batch.batch['feas_weight_r'] = weight_r
+        batch.batch['v_f_state_v'] = v_f_v
+        batch.batch['v_f_state_r'] = v_f_r
+        batch.batch['feas_gate'] = both_ok
+        batch.batch['feas_weight'] = w
         batch.batch['v_f_state'] = v_f_s
         return batch
 
@@ -1242,7 +1344,11 @@ class RayPPOTrainer(object):
                             reward_metrics = reward_result['metrics']
                             cost_tensor = reward_result.get('cost_tensor', None)
                             expert_token_mask = reward_result.get('expert_token_mask', None)
+                            expert_token_mask_v = reward_result.get('expert_token_mask_v', None)
+                            expert_token_mask_r = reward_result.get('expert_token_mask_r', None)
                             feasibility_mask = reward_result.get('feasibility_mask', None)
+                            feasibility_mask_v = reward_result.get('feasibility_mask_v', None)
+                            feasibility_mask_r = reward_result.get('feasibility_mask_r', None)
                             feasibility_returns = reward_result.get('feasibility_returns', None)
                             c_f_discounted = reward_result.get('c_f_discounted', None)
                         except Exception as e:
@@ -1252,7 +1358,11 @@ class RayPPOTrainer(object):
                             reward_metrics = {}
                             cost_tensor = None
                             expert_token_mask = None
+                            expert_token_mask_v = None
+                            expert_token_mask_r = None
                             feasibility_mask = None
+                            feasibility_mask_v = None
+                            feasibility_mask_r = None
                             feasibility_returns = None
                             c_f_discounted = None
                         multiturn_metrics = {f'multiturn/{k}': v for k, v in reward_metrics.items()}
@@ -1262,8 +1372,16 @@ class RayPPOTrainer(object):
                             batch.batch['token_level_costs'] = cost_tensor
                         if expert_token_mask is not None:
                             batch.batch['expert_token_mask'] = expert_token_mask
+                        if expert_token_mask_v is not None:
+                            batch.batch['expert_token_mask_v'] = expert_token_mask_v
+                        if expert_token_mask_r is not None:
+                            batch.batch['expert_token_mask_r'] = expert_token_mask_r
                         if feasibility_mask is not None:
                             batch.batch['feasibility_mask'] = feasibility_mask
+                        if feasibility_mask_v is not None:
+                            batch.batch['feasibility_mask_v'] = feasibility_mask_v
+                        if feasibility_mask_r is not None:
+                            batch.batch['feasibility_mask_r'] = feasibility_mask_r
                         if feasibility_returns is not None:
                             batch.batch['feasibility_returns'] = feasibility_returns
                         if c_f_discounted is not None:
@@ -1272,6 +1390,11 @@ class RayPPOTrainer(object):
                         print(f'{list(reward_extra_infos_dict.keys())=}')
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                        # Optional diagnostic: same-UID P(fail|x). Does not overwrite G_i^F.
+                        if self.dual_critic and 'feasibility_returns' in batch.batch:
+                            from verl.trainer.ppo.expert_buffer import log_problem_level_fail_rate
+                            metrics.update(log_problem_level_fail_rate(batch))
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -1285,8 +1408,11 @@ class RayPPOTrainer(object):
                         # compute advantages, executed on the driver process
                         assert self.config.algorithm.adv_estimator == 'gae', "Currently, only PPO is supported for multi-turn"
                         constraint_active = self._constraint_active()
-                        # Warmup: still build returns_f for V_F, but λ=0 → pure reward PPO
-                        eff_lambda = self.lagrange_lambda if constraint_active else 0.0
+                        # Default: state-level gate only (λ=0). Optional CMDP: A_r - λ A_f.
+                        if self.use_lagrangian and constraint_active:
+                            eff_lambda = self.lagrange_lambda
+                        else:
+                            eff_lambda = 0.0
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1299,10 +1425,47 @@ class RayPPOTrainer(object):
                             dual_critic=self.dual_critic,
                         )
 
-                        # Dual ascent: J_F = E[Σ_i γ_F^{i-1} c_i^F] (turn-level), not token-mean
-                        if self.dual_critic and (
+                        # Monitor E[P]; dual ascent only if use_lagrangian
+                        if self.dual_critic and 'feasibility_returns' in batch.batch:
+                            fr = batch.batch['feasibility_returns'].float()
+                            fm = batch.batch.get('feasibility_mask')
+                            if fm is not None:
+                                fm = fm.bool()
+                                row_p = torch.zeros(fr.size(0), device=fr.device, dtype=fr.dtype)
+                                for i in range(fr.size(0)):
+                                    if fm[i].any():
+                                        row_p[i] = fr[i][fm[i]].mean()
+                            else:
+                                row_p = fr.mean(dim=-1)
+                            if 'window_valid' in batch.non_tensor_batch:
+                                valid = torch.tensor(
+                                    batch.non_tensor_batch['window_valid'].astype(np.float32),
+                                    device=row_p.device,
+                                )
+                                j_f = (row_p * valid).sum() / valid.sum().clamp(min=1.0)
+                            else:
+                                j_f = row_p.mean()
+                            j_f_val = float(j_f.item())
+                            if self.use_lagrangian and constraint_active:
+                                self.lagrange_lambda = max(
+                                    0.0,
+                                    self.lagrange_lambda
+                                    + self.lagrange_lr * (j_f_val - self.feasibility_epsilon),
+                                )
+                            metrics.update({
+                                'feasibility/J_F': j_f_val,
+                                'feasibility/epsilon': self.feasibility_epsilon,
+                                'feasibility/B_F': self.feasibility_epsilon,  # alias
+                                'feasibility/use_lagrangian': float(self.use_lagrangian),
+                                'feasibility/lagrange_lambda': self.lagrange_lambda,
+                                'feasibility/constraint_violation': j_f_val - self.feasibility_epsilon,
+                                'feasibility/constraint_active': float(constraint_active),
+                                'feasibility/constraint_warmup': float(self.constraint_warmup),
+                            })
+                        elif self.dual_critic and (
                             'c_f_discounted' in batch.batch or 'token_level_costs' in batch.batch
                         ):
+                            # legacy fallback
                             if 'c_f_discounted' in batch.batch:
                                 ep_cost = batch.batch['c_f_discounted'].float()
                             else:
@@ -1316,36 +1479,52 @@ class RayPPOTrainer(object):
                             else:
                                 j_f = ep_cost.mean()
                             j_f_val = float(j_f.item())
-                            if constraint_active:
+                            if self.use_lagrangian and constraint_active:
                                 self.lagrange_lambda = max(
                                     0.0,
-                                    self.lagrange_lambda + self.lagrange_lr * (j_f_val - self.cost_budget),
+                                    self.lagrange_lambda
+                                    + self.lagrange_lr * (j_f_val - self.feasibility_epsilon),
                                 )
                             metrics.update({
                                 'feasibility/J_F': j_f_val,
-                                'feasibility/B_F': self.cost_budget,
+                                'feasibility/epsilon': self.feasibility_epsilon,
+                                'feasibility/B_F': self.feasibility_epsilon,
+                                'feasibility/use_lagrangian': float(self.use_lagrangian),
                                 'feasibility/lagrange_lambda': self.lagrange_lambda,
-                                'feasibility/constraint_violation': j_f_val - self.cost_budget,
+                                'feasibility/constraint_violation': j_f_val - self.feasibility_epsilon,
                                 'feasibility/constraint_active': float(constraint_active),
                                 'feasibility/constraint_warmup': float(self.constraint_warmup),
                             })
 
-                            # VF target audit on routing-state mask (feasibility_mask)
-                            if 'returns_f' in batch.batch and 'values_f' in batch.batch:
+                        # VF target audit on routing-state mask (must run on main
+                        # feasibility_returns path, not only legacy elif).
+                        if self.dual_critic and 'values_f' in batch.batch:
+                            returns_f = batch.batch.get('returns_f')
+                            if returns_f is None:
+                                returns_f = batch.batch.get('feasibility_returns')
+                            if returns_f is not None:
                                 wv = batch.non_tensor_batch.get('window_valid', None)
                                 route = batch.batch.get('feasibility_mask', batch.batch['multiturn_mask'])
                                 audit = compute_vf_target_audit(
                                     costs=batch.batch.get(
                                         'token_level_costs',
-                                        torch.zeros_like(batch.batch['returns_f']),
+                                        torch.zeros_like(returns_f),
                                     ),
-                                    returns_f=batch.batch['returns_f'],
+                                    returns_f=returns_f,
                                     values_f=batch.batch['values_f'],
                                     multiturn_mask=route,
                                     window_valid=wv,
                                     cost_budget=self.cost_budget,
                                 )
                                 metrics.update(audit)
+                                if 'feasibility_mask_v' in batch.batch:
+                                    metrics['vf_audit/n_sv'] = float(
+                                        batch.batch['feasibility_mask_v'].float().sum().item()
+                                    )
+                                if 'feasibility_mask_r' in batch.batch:
+                                    metrics['vf_audit/n_sr'] = float(
+                                        batch.batch['feasibility_mask_r'].float().sum().item()
+                                    )
                                 if int(self.global_steps) % 10 == 0:
                                     print(
                                         "[vf_audit] "
@@ -1355,6 +1534,9 @@ class RayPPOTrainer(object):
                                         f"E_vf|G>0={audit['vf_audit/E_vf_at_G_pos']:.4f} "
                                         f"E_vf|G=0={audit['vf_audit/E_vf_at_G_zero']:.4f} "
                                         f"gap={audit['vf_audit/E_vf_G_gap']:.4f} "
+                                        f"vf_std={audit.get('vf_audit/vf_std', 0):.4f} "
+                                        f"n_sv={metrics.get('vf_audit/n_sv', -1):.0f} "
+                                        f"n_sr={metrics.get('vf_audit/n_sr', -1):.0f} "
                                         f"P(c|V>B)={audit['vf_audit/P_c_given_vf_above_B']:.3f} "
                                         f"P(c|V≤B)={audit['vf_audit/P_c_given_vf_at_or_below_B']:.3f}"
                                     )
@@ -1362,6 +1544,32 @@ class RayPPOTrainer(object):
                         # Feasibility gate + expert buffer for BC
                         if self.expert_bc or self.dual_critic:
                             batch = self._compute_feasibility_gates(batch)
+                            # Step-5: log paper g=1[V_F>ε] BEFORE warmup force-feasible
+                            if (
+                                'values_f' in batch.batch
+                                and 'feasibility_returns' in batch.batch
+                                and 'feasibility_mask' in batch.batch
+                            ):
+                                wv = batch.non_tensor_batch.get('window_valid', None)
+                                gate_m = compute_gate_sanity_metrics(
+                                    batch.batch['values_f'],
+                                    batch.batch['feasibility_returns'],
+                                    batch.batch['feasibility_mask'],
+                                    feasibility_mask_v=batch.batch.get('feasibility_mask_v'),
+                                    feasibility_mask_r=batch.batch.get('feasibility_mask_r'),
+                                    eps=float(self.feasibility_epsilon),
+                                    window_valid=wv,
+                                )
+                                metrics.update(gate_m)
+                                print(format_gate_sanity(gate_m))
+                            # Step-6: self-bootstrap coverage BEFORE warmup / transfer / GPT
+                            # s_B→a_B+ problem-conditioned replay; GPT stays off by default.
+                            if 'uid' in batch.non_tensor_batch:
+                                boot_m = bootstrap_coverage_from_batch(
+                                    batch, eps=float(self.feasibility_epsilon)
+                                )
+                                metrics.update(boot_m)
+                                print(format_bootstrap_coverage(boot_m))
                             if 'feas_gate' in batch.batch:
                                 frac, vf_m = self._feasibility_frac_valid(batch)
                                 metrics['feasibility/feasible_frac'] = frac
@@ -1370,6 +1578,12 @@ class RayPPOTrainer(object):
                                 if not constraint_active:
                                     batch.batch['feas_gate'] = torch.ones_like(batch.batch['feas_gate'])
                                     batch.batch['feas_weight'] = torch.zeros_like(batch.batch['feas_weight'])
+                                    for k in ('feas_gate_v', 'feas_gate_r'):
+                                        if k in batch.batch:
+                                            batch.batch[k] = torch.ones_like(batch.batch[k])
+                                    for k in ('feas_weight_v', 'feas_weight_r'):
+                                        if k in batch.batch:
+                                            batch.batch[k] = torch.zeros_like(batch.batch[k])
                             if 'expert_token_mask' in batch.batch:
                                 n_push = self.expert_buffer.push_from_batch(batch)
                                 metrics['feasibility/expert_buffer_size'] = len(self.expert_buffer)

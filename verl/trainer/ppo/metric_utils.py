@@ -880,6 +880,8 @@ def compute_vf_target_audit(
         e_vf_at_g_zero = 0.0
         n_g_zero = 0.0
     e_vf_g_gap = e_vf_at_g_pos - e_vf_at_g_zero
+    vf_std = float(vf_mt.std(unbiased=False).item()) if vf_mt.numel() > 1 else 0.0
+    n_route = float(row_mt.sum().item())
 
     # Gate calibration (sample-level): P(c^F=1 | V_F_state ? B_F)
     # V_F_state = mean V_F on routing mask positions (same as feas_gate).
@@ -990,6 +992,8 @@ def compute_vf_target_audit(
         'vf_audit/E_vf_at_G_pos': float(e_vf_at_g_pos),
         'vf_audit/E_vf_at_G_zero': float(e_vf_at_g_zero),
         'vf_audit/E_vf_G_gap': float(e_vf_g_gap),
+        'vf_audit/vf_std': float(vf_std),
+        'vf_audit/n_routing': float(n_route),
         'vf_audit/n_routing_G_pos': float(n_g_pos),
         'vf_audit/n_routing_G_zero': float(n_g_zero),
         # Gate calibration vs B_F (0 if cost_budget not passed)

@@ -853,10 +853,10 @@ class CriticWorker(Worker):
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
             values = self.critic.compute_values(data=data)
             if values.dim() == 3 and values.size(-1) >= 2:
-                # dual head: [:,:,0]=VR (reward), [:,:,1]=VF (failure cost)
+                # dual head: [:,:,0]=VR; [:,:,1]=VF logits → sigmoid → P(fail|s)∈[0,1]
                 output = DataProto.from_dict(tensors={
                     'values': values[..., 0],
-                    'values_f': values[..., 1],
+                    'values_f': torch.sigmoid(values[..., 1]),
                 })
             else:
                 if values.dim() == 3:

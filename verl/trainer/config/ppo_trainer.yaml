@@ -214,15 +214,18 @@ algorithm:
   use_kl_in_reward: False
   kl_penalty: kl  # how to estimate kl divergence
   norm_type: whole
-  # Feasibility-guided CMDP: max J_R s.t. J_F <= B_F via Lagrangian
+  # Role-aware feasibility: s^V=(x,y_i), s^R=(x,y_i,v_i); V_F(s)≈P(fail|s) from G_F.
+  # F(s)=V_F-ε gates that role's expert BC. Branching optional for calibration only.
   dual_critic: False
+  use_lagrangian: False  # True → A_r-λA_f + dual ascent on E[P]≤ε (ablation)
   lagrange_lambda_init: 0.0
   lagrange_lr: 0.001
-  cost_budget: 0.3   # B_F
+  cost_budget: 0.3   # ε (=FEAS_THRESHOLD); F(s)=V_F(s)-ε. Not a CMDP B_F unless use_lagrangian
   cost_gamma: 1.0    # unused when feasibility_returns set (legacy token-GAE fallback only)
-  # Steps with pure PPO (λ=0, no infeasible BC/GPT). Still trains V_F. 0 = off.
+  # Steps with no infeasible BC/GPT (λ frozen if Lagrangian on). Still trains V_F. 0 = off.
   constraint_warmup: 50
-  # When V_F > B_F: keep PG, add high-weight expert BC (see actor.expert_bc_coef)
+  # When V_F > ε: keep PG, add high-weight expert BC (see actor.expert_bc_coef).
+  # V_F ≤ ε: PPO only (actor.expert_bc_light default 0).
   expert_bc: False
   expert_buffer_capacity: 256
   # Copy same-uid successful bootstrap traj onto infeasible siblings (no API)

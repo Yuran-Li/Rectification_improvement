@@ -243,7 +243,17 @@ class DataParallelPPOActor(BasePPOActor):
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
         # Feasibility-gated expert BC (optional tensors from trainer)
-        for k in ('expert_token_mask', 'feas_gate', 'feas_weight'):
+        for k in (
+            'expert_token_mask',
+            'expert_token_mask_v',
+            'expert_token_mask_r',
+            'feas_gate',
+            'feas_weight',
+            'feas_gate_v',
+            'feas_gate_r',
+            'feas_weight_v',
+            'feas_weight_r',
+        ):
             if k in data.batch.keys():
                 select_keys.append(k)
         batch = data.select(batch_keys=select_keys).batch
@@ -340,9 +350,10 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics['actor/kl_loss'] = kl_loss.detach().item()
                         metrics['actor/kl_coef'] = self.config.kl_loss_coef
 
-                    # Expert BC (weighted):
-                    #   infeasible → high w = (1-g)*max(feas_weight,1)
-                    #   feasible + expert_bc_light → light w on successful spans
+                    # Expert BC (role-aware):
+                    #   F(s^V)>0 → weight verify expert tokens
+                    #   F(s^R)>0 → weight rectify expert tokens
+                    #   F≤0 → PPO only unless expert_bc_light>0
                     bc_loss_val = 0.0
                     bc_scale_val = 0.0
                     bc_weighted_val = 0.0
@@ -355,46 +366,67 @@ class DataParallelPPOActor(BasePPOActor):
                         has_e = (
                             expert_mask_raw.reshape(expert_mask_raw.size(0), -1).sum(dim=-1, keepdim=True) > 0
                         ).float()
-                        row_w = torch.zeros(
-                            expert_mask_raw.size(0), 1, device=expert_mask_raw.device, dtype=expert_mask_raw.dtype
+                        # Token weights: start from zeros, add role-specific high BC
+                        expert_w = torch.zeros_like(expert_mask_raw)
+                        role_aware = (
+                            'expert_token_mask_v' in data
+                            and 'expert_token_mask_r' in data
+                            and 'feas_gate_v' in data
+                            and 'feas_gate_r' in data
                         )
-                        if 'feas_gate' in data:
-                            g = data['feas_gate'].float()
-                            if g.dim() == 1:
-                                g = g.unsqueeze(-1)
-                            row_w = (1.0 - g)
-                        if 'feas_weight' in data:
-                            w = data['feas_weight'].float()
-                            if w.dim() == 1:
-                                w = w.unsqueeze(-1)
-                            infeas = row_w
-                            row_w = infeas * torch.clamp(w, min=1.0)
-                        high_rows = (row_w.squeeze(-1) > 0) & (has_e.squeeze(-1) > 0)
+                        if role_aware:
+                            ev = data['expert_token_mask_v'].float()
+                            er = data['expert_token_mask_r'].float()
+                            gv = data['feas_gate_v'].float().view(-1, 1)
+                            gr = data['feas_gate_r'].float().view(-1, 1)
+                            wv = data['feas_weight_v'].float().view(-1, 1) if 'feas_weight_v' in data else torch.ones_like(gv)
+                            wr = data['feas_weight_r'].float().view(-1, 1) if 'feas_weight_r' in data else torch.ones_like(gr)
+                            expert_w = expert_w + ev * (1.0 - gv) * torch.clamp(wv, min=1.0)
+                            expert_w = expert_w + er * (1.0 - gr) * torch.clamp(wr, min=1.0)
+                            high_rows = (expert_w.reshape(expert_w.size(0), -1).sum(dim=-1) > 0) & (
+                                has_e.squeeze(-1) > 0
+                            )
+                            row_w_mean = (1.0 - torch.minimum(gv, gr)).squeeze(-1)
+                        else:
+                            row_w = torch.zeros(
+                                expert_mask_raw.size(0), 1, device=expert_mask_raw.device, dtype=expert_mask_raw.dtype
+                            )
+                            if 'feas_gate' in data:
+                                g = data['feas_gate'].float()
+                                if g.dim() == 1:
+                                    g = g.unsqueeze(-1)
+                                row_w = (1.0 - g)
+                            if 'feas_weight' in data:
+                                w = data['feas_weight'].float()
+                                if w.dim() == 1:
+                                    w = w.unsqueeze(-1)
+                                row_w = row_w * torch.clamp(w, min=1.0)
+                            high_rows = (row_w.squeeze(-1) > 0) & (has_e.squeeze(-1) > 0)
+                            expert_w = expert_mask_raw * row_w
+                            row_w_mean = row_w.squeeze(-1)
                         if expert_bc_light > 0:
-                            # successful expert rows still get a small BC even if feasible
-                            row_w = torch.maximum(row_w, expert_bc_light * has_e)
+                            expert_w = torch.maximum(expert_w, expert_bc_light * expert_mask_raw * has_e)
                         light_only = (
                             (has_e.squeeze(-1) > 0)
                             & (~high_rows)
-                            & (row_w.squeeze(-1) > 0)
+                            & (expert_w.reshape(expert_w.size(0), -1).sum(dim=-1) > 0)
                         )
-                        expert_mask = expert_mask_raw * row_w
                         # unweighted expert tokens (before row β); for coverage sanity
                         bc_n_tokens = float(expert_mask_raw.sum().item())
                         bc_n_samples = float(has_e.sum().item())
                         bc_n_high = float(high_rows.sum().item())
                         bc_n_light = float(light_only.sum().item())
-                        if expert_mask.sum() > 0:
+                        if expert_w.sum() > 0:
                             bc_loss = agg_loss(
                                 loss_mat=-log_prob,
-                                loss_mask=expert_mask,
+                                loss_mask=expert_w,
                                 loss_agg_mode=loss_agg_mode,
                             )
                             weighted_bc = expert_bc_coef * bc_loss
                             policy_loss = policy_loss + weighted_bc
                             bc_loss_val = float(bc_loss.detach().item())
                             bc_weighted_val = float(weighted_bc.detach().item())
-                            bc_scale_val = float(row_w.mean().item())
+                            bc_scale_val = float(row_w_mean.mean().item())
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz

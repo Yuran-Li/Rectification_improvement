@@ -140,16 +140,21 @@ class vLLMPAGRollout(vLLMRollout):
             max_model_len = self.config.response_length * self.num_turns * 2 + config.prompt_length
             max_model_len = min(max_model_len, model_hf_config.max_position_embeddings)
         else:
+            # Full-concat budget; clamp to HF context (e.g. Math-7B = 4096).
             max_model_len = (
                 config.prompt_length
                 + self.num_turns * self.config.response_length
                 + (self.num_turns - 1) * (200 + self.config.response_length)
             )
+            max_model_len = min(max_model_len, model_hf_config.max_position_embeddings)
 
         if config.get('max_model_len', None) is not None:
             max_model_len = config.get('max_model_len')
-        assert model_hf_config.max_position_embeddings >= max_model_len, \
-            "model context length should be greater than total sequence length"
+        assert model_hf_config.max_position_embeddings >= max_model_len, (
+            f"model context length ({model_hf_config.max_position_embeddings}) "
+            f"should be >= max_model_len ({max_model_len}); "
+            f"reduce MAX_PROMPT/MAX_RESP/NUM_TURNS or set rollout.max_model_len"
+        )
         print(f"[vLLMPAGRollout] slide_window={self.slide_window} max_model_len={max_model_len} "
               f"num_turns={self.num_turns} response_length={self.config.response_length}")
 

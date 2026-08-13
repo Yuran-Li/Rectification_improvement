@@ -16,7 +16,7 @@ Implement a multiprocess PPOCritic
 
 Supports:
   - num_labels=1: standard value head VR
-  - num_labels=2: dual heads VR (reward return) + VF (failure-cost return)
+  - num_labels=2: dual heads VR (reward return) + VF (failure prob; BCE-with-logits)
 """
 import itertools
 from typing import Iterable
@@ -254,29 +254,25 @@ class DataParallelPPOCritic(BasePPOCritic):
                     }
 
                     if dual and vpred_f is not None:
-                        # VF only on answer routing states (turn-level G_F targets)
+                        # VF: BCE-with-logits on G_F ∈ {0,1} at s^V / s^R only
                         if 'feasibility_mask' in data:
                             vf_f_mask = data['feasibility_mask']
                         else:
                             vf_f_mask = response_mask
                         if vf_f_mask.float().sum() < 1:
                             vf_loss_f = torch.zeros((), device=vpred_f.device)
-                            vf_clipfrac_f = torch.zeros((), device=vpred_f.device)
                             vpred_f_mean = 0.0
                         else:
-                            vf_loss_f, vf_clipfrac_f = core_algos.compute_value_loss(
-                                vpreds=vpred_f,
-                                values=data['values_f'],
-                                returns=data['returns_f'],
+                            vf_loss_f, vpred_f_mean_t = core_algos.compute_feasibility_bce_loss(
+                                logits=vpred_f,
+                                targets=data['returns_f'],
                                 response_mask=vf_f_mask,
-                                cliprange_value=self.config.cliprange_value,
                             )
-                            vpred_f_mean = masked_mean(vpred_f, vf_f_mask).detach().item()
+                            vpred_f_mean = float(vpred_f_mean_t.detach().item())
                         vf_loss = vf_loss_r + self.vf_loss_coef * vf_loss_f
                         log_data.update({
                             'critic/vf_loss_r': vf_loss_r.detach().item(),
                             'critic/vf_loss_f': vf_loss_f.detach().item(),
-                            'critic/vf_clipfrac_f': vf_clipfrac_f.detach().item(),
                             'critic/vpred_f_mean': vpred_f_mean,
                             'critic/vf_f_n_routing': vf_f_mask.float().sum().detach().item(),
                         })

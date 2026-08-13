@@ -10,6 +10,72 @@ import torch
 from verl import DataProto
 
 
+def log_problem_level_fail_rate(batch: DataProto) -> Dict[str, float]:
+    """Diagnostic only: same-UID mean of traj fails ≈ P(fail|x). Does NOT train V_F.
+
+    State-level V_F uses per-state on-policy G_i^F; do not overwrite those targets
+    with this aggregate. Optional branching is for calibration, not this helper.
+    """
+    metrics = {
+        "feasibility/problem_p_groups": 0.0,
+        "feasibility/problem_p_mean": 0.0,
+        "feasibility/problem_p_trajs_per_group": 0.0,
+    }
+    if "feasibility_mask" not in batch.batch or "feasibility_returns" not in batch.batch:
+        return metrics
+    if "uid" not in batch.non_tensor_batch:
+        return metrics
+
+    fm = batch.batch["feasibility_mask"].bool()
+    fr = batch.batch["feasibility_returns"]
+    B = fr.size(0)
+    uids = batch.non_tensor_batch["uid"]
+    window_index = batch.non_tensor_batch.get("window_index", None)
+    window_valid = batch.non_tensor_batch.get("window_valid", None)
+
+    row_mc = torch.zeros(B, device=fr.device, dtype=fr.dtype)
+    for i in range(B):
+        m = fm[i]
+        if m.any():
+            row_mc[i] = fr[i][m].mean()
+
+    groups: Dict[object, List[int]] = defaultdict(list)
+    for i in range(B):
+        groups[uids[i]].append(i)
+
+    p_vals = []
+    trajs_per = []
+    for idxs in groups.values():
+        if window_index is not None:
+            traj_rows = [i for i in idxs if int(window_index[i]) == 0]
+            if not traj_rows:
+                traj_rows = list(idxs)
+        else:
+            traj_rows = list(idxs)
+        if window_valid is not None:
+            valid_traj = [i for i in traj_rows if bool(window_valid[i])]
+            if valid_traj:
+                traj_rows = valid_traj
+        p = float(row_mc[traj_rows].mean().item()) if traj_rows else 0.0
+        p_vals.append(p)
+        trajs_per.append(float(len(traj_rows)))
+    metrics["feasibility/problem_p_groups"] = float(len(groups))
+    metrics["feasibility/problem_p_mean"] = float(np.mean(p_vals)) if p_vals else 0.0
+    metrics["feasibility/problem_p_trajs_per_group"] = (
+        float(np.mean(trajs_per)) if trajs_per else 0.0
+    )
+    return metrics
+
+
+def aggregate_recovery_failure_prob(batch: DataProto) -> Tuple[DataProto, Dict[str, float]]:
+    """Deprecated for V_F training. Kept as alias that only logs problem-level diagnostics.
+
+    Previously overwrote state-level G_i^F with P̂(fail|x). That mixes problem-level
+    into a state-level critic. Training must keep per-state MC targets.
+    """
+    return batch, log_problem_level_fail_rate(batch)
+
+
 def transfer_same_uid_bootstrap(batch: DataProto) -> Tuple[DataProto, Dict[str, float]]:
     """Copy successful expert rows onto infeasible same-uid siblings.
 
@@ -58,6 +124,8 @@ def transfer_same_uid_bootstrap(batch: DataProto) -> Tuple[DataProto, Dict[str, 
         for k in (
             "responses",
             "expert_token_mask",
+            "expert_token_mask_v",
+            "expert_token_mask_r",
             "multiturn_mask",
             "input_ids",
             "attention_mask",

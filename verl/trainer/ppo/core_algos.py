@@ -462,6 +462,28 @@ def compute_value_loss(vpreds, returns, values, response_mask, cliprange_value):
     return vf_loss, vf_clipfrac
 
 
+def compute_feasibility_bce_loss(logits, targets, response_mask):
+    """BCE-with-logits for V_F(s) ≈ P(eventual fail | s).
+
+    Args:
+        logits: raw V_F head outputs (not probabilities)
+        targets: G_F ∈ {0,1} on routing states
+        response_mask: typically feasibility_mask (s^V ∪ s^R)
+
+    Returns:
+        loss: masked mean BCE
+        pred_mean: mean sigmoid(logits) on mask (for logging)
+    """
+    targets = targets.float()
+    loss_mat = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits, targets, reduction='none'
+    )
+    loss = verl_F.masked_mean(loss_mat, response_mask)
+    with torch.no_grad():
+        pred_mean = verl_F.masked_mean(torch.sigmoid(logits), response_mask)
+    return loss, pred_mean
+
+
 def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
     """Compute KL divergence given logprob and ref_logprob.
     Copied from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1104

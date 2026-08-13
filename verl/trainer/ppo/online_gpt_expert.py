@@ -1,8 +1,9 @@
-"""Online GPT expert for infeasible tasks.
+"""Online GPT expert: state-conditioned recovery supervision.
 
-When V_F > B_F and no bootstrap expert exists for that sample, call an
-OpenAI-compatible API to produce verify + correct rectify, then overwrite
-the row's response with an expert trajectory for BC.
+Gate at decision state s → expert action with matching conditioning:
+  F(s^V)>ε, s^V=(x,y_i)  → v^E ~ π_E(·|x,y_i)
+  F(s^R)>ε, s^R=(x,y_i,v_i^A) → y_{i+1}^E ~ π_E(·|x,y_i,v_i^A)
+  (freeze student prefix; do NOT regenerate verify when gating s^R)
 
 Requires OPENAI_API_KEY; optional OPENAI_BASE_URL.
 """
@@ -43,7 +44,7 @@ CRITIQUE_SYSTEM = (
 
 SOLVE_SYSTEM = (
     "You are an expert math tutor. Given a problem and an incorrect student solution "
-    "(plus a short error diagnosis), write a complete correct solution. "
+    "(plus the student's own error diagnosis), write a complete correct solution. "
     "Reason step by step and put the final answer within \\boxed{}."
 )
 
@@ -112,7 +113,6 @@ def extract_problem_text(tokenizer, prompt_ids: torch.Tensor, pad_token_id: int)
     ids = prompt_ids.detach().cpu().tolist()
     ids = [t for t in ids if t != pad_token_id]
     text = tokenizer.decode(ids, skip_special_tokens=True)
-    # Prefer last user turn content if chat markers present
     for marker in ("user\n", "User:", "user:"):
         if marker in text:
             text = text.split(marker)[-1]
@@ -133,9 +133,31 @@ def extract_wrong_answer_ids(
     ids = [t for t in response_ids if t != pad_token_id]
     pos = find_subsequence(ids, verify_tokens)
     if pos <= 0:
-        # fallback: whole non-pad response as wrong attempt
         return ids[: min(len(ids), 512)]
     return ids[:pos]
+
+
+def split_response_roles(
+    response_ids: Sequence[int],
+    verify_tokens: Sequence[int],
+    regen_tokens: Sequence[int],
+    pad_token_id: int,
+) -> Tuple[List[int], List[int], List[int], int, int]:
+    """Split into (y_ids, v_ids, y_next_ids, verify_model_start, rectify_start)."""
+    ids = [int(t) for t in response_ids if int(t) != pad_token_id]
+    vpos = find_subsequence(ids, verify_tokens)
+    if vpos < 0:
+        return ids, [], [], -1, -1
+    y_ids = ids[:vpos]
+    after_v_tmpl = vpos + len(verify_tokens)
+    rpos = find_subsequence(ids[after_v_tmpl:], regen_tokens)
+    if rpos < 0:
+        return y_ids, ids[after_v_tmpl:], [], after_v_tmpl, -1
+    rpos = after_v_tmpl + rpos
+    v_ids = ids[after_v_tmpl:rpos]
+    rectify_start = rpos + len(regen_tokens)
+    y_next = ids[rectify_start:]
+    return y_ids, v_ids, y_next, after_v_tmpl, rectify_start
 
 
 @dataclass
@@ -189,12 +211,12 @@ class OnlineGPTExpertClient:
                 time.sleep(min(2 ** attempt, 20))
         raise RuntimeError(f"GPT call failed: {last_err}")
 
-    def generate_expert(self, problem: str, wrong_attempt: str) -> GPTExpertResult:
+    def generate_verify(self, problem: str, wrong_attempt: str) -> str:
+        """v^E ~ π_E(· | s^V=(x,y_i))."""
         if self.solve_fn is not None:
-            return self.solve_fn(problem, wrong_attempt)
-
+            return self.solve_fn(problem, wrong_attempt).verify_text
         wrong = truncate(wrong_attempt)
-        verify_messages = [
+        messages = [
             {"role": "system", "content": CRITIQUE_SYSTEM},
             {
                 "role": "user",
@@ -205,27 +227,38 @@ class OnlineGPTExpertClient:
                 ),
             },
         ]
-        verify_text = self._call(verify_messages, self.max_tokens_verify)
+        verify_text = self._call(messages, self.max_tokens_verify)
         verify_text = re.sub(r"\\boxed\{[^{}]*\}", "[ANSWER REMOVED]", verify_text).strip()
-        if "The answer is wrong" not in verify_text:
+        if "The answer is wrong" not in verify_text and "The answer is correct" not in verify_text:
             verify_text = (verify_text + "\nThe answer is wrong.").strip()
+        return verify_text
 
-        solve_messages = [
+    def generate_rectify(self, problem: str, wrong_attempt: str, student_verify: str) -> str:
+        """y^E ~ π_E(· | s^R=(x,y_i,v_i^A)) — freeze student verify."""
+        if self.solve_fn is not None:
+            return self.solve_fn(problem, wrong_attempt).rectify_text
+        wrong = truncate(wrong_attempt)
+        diagnosis = truncate(student_verify, 2000)
+        messages = [
             {"role": "system", "content": SOLVE_SYSTEM},
             {
                 "role": "user",
                 "content": (
                     f"Problem:\n{problem}\n\n"
                     f"Incorrect solution:\n{wrong}\n\n"
-                    f"Error diagnosis:\n{verify_text}\n\n"
+                    f"Student error diagnosis:\n{diagnosis}\n\n"
                     "Provide the correct solution with \\boxed{}."
                 ),
             },
         ]
-        rectify_text = self._call(solve_messages, self.max_tokens_rectify)
-        if "\\boxed{" not in rectify_text:
-            # still usable as BC target; keep as-is
-            pass
+        return self._call(messages, self.max_tokens_rectify)
+
+    def generate_expert(self, problem: str, wrong_attempt: str) -> GPTExpertResult:
+        """Legacy both-roles helper for tests."""
+        if self.solve_fn is not None:
+            return self.solve_fn(problem, wrong_attempt)
+        verify_text = self.generate_verify(problem, wrong_attempt)
+        rectify_text = self.generate_rectify(problem, wrong_attempt, verify_text)
         return GPTExpertResult(verify_text=verify_text, rectify_text=rectify_text)
 
 
@@ -240,22 +273,18 @@ def pack_expert_response(
     device,
     dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build slide-window style response + masks.
-
-    Returns responses, resp_attn, multiturn_mask, expert_token_mask (1D each).
-    """
+    """Legacy full-traj pack (tests). Production fill uses role-specific rewrite."""
     pieces = [
-        (answer_ids, False, False),       # context / failed attempt
-        (verify_tokens, False, False),    # user template
-        (verify_ids, True, True),         # GPT verify (BC)
-        (regen_tokens, False, False),     # user template
-        (rectify_ids, True, True),        # GPT rectify (BC)
+        (answer_ids, False, False),
+        (verify_tokens, False, False),
+        (verify_ids, True, True),
+        (regen_tokens, False, False),
+        (rectify_ids, True, True),
     ]
     responses = torch.full((max_resp,), pad_token_id, device=device, dtype=dtype)
     resp_attn = torch.zeros((max_resp,), dtype=torch.bool, device=device)
     multiturn_mask = torch.zeros((max_resp,), dtype=torch.bool, device=device)
     expert_mask = torch.zeros((max_resp,), dtype=torch.bool, device=device)
-
     pos = 0
     for piece, is_model, is_expert in pieces:
         n = len(piece)
@@ -274,6 +303,38 @@ def pack_expert_response(
     return responses, resp_attn, multiturn_mask, expert_mask
 
 
+def _rebuild_row_prefix(
+    batch: DataProto,
+    i: int,
+    prompts: torch.Tensor,
+    new_resp: torch.Tensor,
+    resp_attn: torch.Tensor,
+    max_resp: int,
+    device,
+) -> None:
+    prompt_i = prompts[i]
+    prompt_len = prompt_i.size(0)
+    batch.batch["responses"][i] = new_resp
+    batch.batch["input_ids"][i] = torch.cat([prompt_i, new_resp], dim=-1)
+    if "attention_mask" in batch.batch:
+        attn = batch.batch["attention_mask"][i]
+        prompt_attn = attn[:prompt_len]
+        batch.batch["attention_mask"][i] = torch.cat([prompt_attn, resp_attn], dim=-1)
+    if "position_ids" in batch.batch:
+        pos = batch.batch["position_ids"][i]
+        prompt_pos = pos[:prompt_len]
+        if prompt_pos.dim() == 1:
+            delta = torch.arange(1, max_resp + 1, device=device, dtype=prompt_pos.dtype)
+            resp_pos = prompt_pos[-1:] + delta
+            batch.batch["position_ids"][i] = torch.cat([prompt_pos, resp_pos], dim=-1)
+    if "advantages" in batch.batch:
+        batch.batch["advantages"][i].zero_()
+    if "old_log_probs" in batch.batch:
+        batch.batch["old_log_probs"][i].zero_()
+    if "ref_log_prob" in batch.batch:
+        batch.batch["ref_log_prob"][i].zero_()
+
+
 def fill_infeasible_with_online_gpt(
     batch: DataProto,
     tokenizer,
@@ -282,17 +343,16 @@ def fill_infeasible_with_online_gpt(
     prefer_bootstrap: bool = True,
     num_workers: int = 4,
 ) -> Tuple[DataProto, Dict[str, float]]:
-    """Overwrite infeasible rows lacking bootstrap experts with GPT trajectories.
-
-    Call after critic update / before actor update. Keeps batch size unchanged.
-    """
+    """State-conditioned GPT at infeasible s^V / s^R (matching student conditioning)."""
     metrics = {
         "feasibility/online_gpt_candidates": 0.0,
         "feasibility/online_gpt_filled": 0.0,
+        "feasibility/online_gpt_filled_v": 0.0,
+        "feasibility/online_gpt_filled_r": 0.0,
         "feasibility/online_gpt_failed": 0.0,
         "feasibility/online_gpt_skipped_bootstrap": 0.0,
     }
-    if "feas_gate" not in batch.batch or "responses" not in batch.batch:
+    if "responses" not in batch.batch:
         return batch, metrics
 
     device = batch.batch["responses"].device
@@ -304,138 +364,190 @@ def fill_infeasible_with_online_gpt(
     verify_tokens = get_template_token_ids(tokenizer, VERIFY_TEMPLATE)
     regen_tokens = get_template_token_ids(tokenizer, REGEN_TEMPLATE)
 
-    feas_gate = batch.batch["feas_gate"]
-    need = feas_gate < 0.5
+    if "feas_gate_r" in batch.batch:
+        need_r = batch.batch["feas_gate_r"] < 0.5
+    elif "feas_gate" in batch.batch:
+        need_r = batch.batch["feas_gate"] < 0.5
+    else:
+        need_r = torch.zeros(B, dtype=torch.bool, device=device)
+    if "feas_gate_v" in batch.batch:
+        need_v = batch.batch["feas_gate_v"] < 0.5
+    elif "feas_gate" in batch.batch:
+        need_v = batch.batch["feas_gate"] < 0.5
+    else:
+        need_v = torch.zeros(B, dtype=torch.bool, device=device)
+
     if "window_valid" in batch.non_tensor_batch:
         valid = torch.tensor(
             batch.non_tensor_batch["window_valid"].astype(np.bool_),
-            device=need.device,
+            device=device,
         )
-        need = need & valid
+        need_r = need_r & valid
+        need_v = need_v & valid
 
-    skipped_bootstrap = 0
-    if prefer_bootstrap and "expert_token_mask" in batch.batch:
-        has_expert = batch.batch["expert_token_mask"].reshape(B, -1).any(dim=-1)
-        skipped_bootstrap = int((need & has_expert).sum().item())
-        need = need & (~has_expert)
-    metrics["feasibility/online_gpt_skipped_bootstrap"] = float(skipped_bootstrap)
+    skipped = 0
+    if prefer_bootstrap:
+        if "expert_token_mask_r" in batch.batch:
+            has_r = batch.batch["expert_token_mask_r"].reshape(B, -1).any(dim=-1)
+            skipped += int((need_r & has_r).sum().item())
+            need_r = need_r & (~has_r)
+        elif "expert_token_mask" in batch.batch:
+            has_e = batch.batch["expert_token_mask"].reshape(B, -1).any(dim=-1)
+            skipped += int((need_r & has_e).sum().item())
+            need_r = need_r & (~has_e)
+        if "expert_token_mask_v" in batch.batch:
+            has_v = batch.batch["expert_token_mask_v"].reshape(B, -1).any(dim=-1)
+            skipped += int((need_v & has_v).sum().item())
+            need_v = need_v & (~has_v)
+        elif "expert_token_mask" in batch.batch:
+            has_e = batch.batch["expert_token_mask"].reshape(B, -1).any(dim=-1)
+            skipped += int((need_v & has_e).sum().item())
+            need_v = need_v & (~has_e)
+    metrics["feasibility/online_gpt_skipped_bootstrap"] = float(skipped)
 
-    idxs = torch.where(need)[0].tolist()
-    metrics["feasibility/online_gpt_candidates"] = float(len(idxs))
-    if not idxs:
+    jobs: List[Tuple[str, int]] = []
+    for i in torch.where(need_r)[0].tolist():
+        jobs.append(("r", i))
+    for i in torch.where(need_v & (~need_r))[0].tolist():
+        jobs.append(("v", i))
+    metrics["feasibility/online_gpt_candidates"] = float(len(jobs))
+    if not jobs:
         return batch, metrics
-
-    if max_per_step > 0 and len(idxs) > max_per_step:
+    if max_per_step > 0 and len(jobs) > max_per_step:
         rng = np.random.default_rng()
-        idxs = rng.choice(idxs, size=max_per_step, replace=False).tolist()
+        pick = rng.choice(len(jobs), size=max_per_step, replace=False)
+        jobs = [jobs[j] for j in pick]
 
-    # prompts may be under 'prompts' or left part of input_ids
     if "prompts" in batch.batch:
         prompts = batch.batch["prompts"]
     else:
-        resp_len = responses.size(1)
-        prompts = batch.batch["input_ids"][:, :-resp_len]
+        prompts = batch.batch["input_ids"][:, :-max_resp]
 
-    jobs = []
-    for i in idxs:
+    if "expert_token_mask" not in batch.batch:
+        batch.batch["expert_token_mask"] = torch.zeros_like(responses, dtype=torch.bool)
+    if "expert_token_mask_v" not in batch.batch:
+        batch.batch["expert_token_mask_v"] = torch.zeros_like(responses, dtype=torch.bool)
+    if "expert_token_mask_r" not in batch.batch:
+        batch.batch["expert_token_mask_r"] = torch.zeros_like(responses, dtype=torch.bool)
+    if "multiturn_mask" not in batch.batch:
+        batch.batch["multiturn_mask"] = torch.zeros_like(responses, dtype=torch.bool)
+
+    prepared = []
+    for role, i in jobs:
         problem = extract_problem_text(tokenizer, prompts[i], pad_id)
-        wrong_ids = extract_wrong_answer_ids(
-            responses[i].detach().cpu().tolist(), verify_tokens, pad_id
+        y_ids, v_ids, _, _, r_start = split_response_roles(
+            responses[i].detach().cpu().tolist(), verify_tokens, regen_tokens, pad_id
         )
-        wrong_text = tokenizer.decode(wrong_ids, skip_special_tokens=True)
-        jobs.append((i, problem, wrong_text, wrong_ids))
+        wrong_text = tokenizer.decode(y_ids, skip_special_tokens=True)
+        student_v = tokenizer.decode(v_ids, skip_special_tokens=True) if v_ids else ""
+        prepared.append((role, i, problem, wrong_text, student_v, y_ids, v_ids, r_start))
 
-    results: Dict[int, Tuple[GPTExpertResult, List[int]]] = {}
+    results: Dict[Tuple[str, int], str] = {}
     failed = 0
 
-    def _one(job):
-        i, problem, wrong_text, wrong_ids = job
-        res = client.generate_expert(problem, wrong_text)
-        return i, res, wrong_ids
+    def _one(item):
+        role, i, problem, wrong_text, student_v, *_rest = item
+        if role == "r":
+            text = client.generate_rectify(
+                problem, wrong_text, student_v or "The answer is wrong."
+            )
+        else:
+            text = client.generate_verify(problem, wrong_text)
+        return role, i, text
 
-    workers = max(1, min(num_workers, len(jobs)))
+    workers = max(1, min(num_workers, len(prepared)))
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(_one, j) for j in jobs]
+        futs = [ex.submit(_one, p) for p in prepared]
         for fut in as_completed(futs):
             try:
-                i, res, wrong_ids = fut.result()
-                if not res.verify_text or not res.rectify_text:
+                role, i, text = fut.result()
+                if not text:
                     failed += 1
                     continue
-                results[i] = (res, wrong_ids)
+                results[(role, i)] = text
             except Exception as e:
                 print(f"[online_gpt_expert] failed: {e}")
                 failed += 1
 
-    metrics["feasibility/online_gpt_failed"] = float(failed)
-    if not results:
-        return batch, metrics
+    filled = filled_v = filled_r = 0
+    meta = {(p[0], p[1]): p for p in prepared}
+    for (role, i), text in results.items():
+        _, _, _, _, _, y_ids, v_ids, r_start = meta[(role, i)]
+        new_resp = torch.full((max_resp,), pad_id, device=device, dtype=dtype)
+        mt = torch.zeros(max_resp, dtype=torch.bool, device=device)
+        exp = torch.zeros(max_resp, dtype=torch.bool, device=device)
+        exp_v = torch.zeros(max_resp, dtype=torch.bool, device=device)
+        exp_r = torch.zeros(max_resp, dtype=torch.bool, device=device)
 
-    # Ensure expert_token_mask exists
-    if "expert_token_mask" not in batch.batch:
-        batch.batch["expert_token_mask"] = torch.zeros_like(responses, dtype=torch.bool)
-
-    filled = 0
-    for i, (res, wrong_ids) in results.items():
-        verify_ids = tokenizer.encode(res.verify_text, add_special_tokens=False)
-        rectify_ids = tokenizer.encode(res.rectify_text, add_special_tokens=False)
-        new_resp, resp_attn, mt_mask, exp_mask = pack_expert_response(
-            answer_ids=wrong_ids,
-            verify_tokens=verify_tokens,
-            verify_ids=verify_ids,
-            regen_tokens=regen_tokens,
-            rectify_ids=rectify_ids,
-            max_resp=max_resp,
-            pad_token_id=pad_id,
-            device=device,
-            dtype=dtype,
-        )
-        if not exp_mask.any():
-            failed += 1
-            continue
-
-        batch.batch["responses"][i] = new_resp
-        batch.batch["expert_token_mask"][i] = exp_mask
-        batch.batch["multiturn_mask"][i] = mt_mask
-
-        # rebuild full sequence tensors
-        prompt_i = prompts[i]
-        prompt_len = prompt_i.size(0)
-        seq = torch.cat([prompt_i, new_resp], dim=-1)
-        batch.batch["input_ids"][i] = seq
-
-        # attention: keep prompt attn, replace response attn
-        if "attention_mask" in batch.batch:
-            attn = batch.batch["attention_mask"][i]
-            prompt_attn = attn[:prompt_len]
-            batch.batch["attention_mask"][i] = torch.cat([prompt_attn, resp_attn], dim=-1)
-
-        if "position_ids" in batch.batch:
-            pos = batch.batch["position_ids"][i]
-            prompt_pos = pos[:prompt_len]
-            # handle 1D or multi-dim rope
-            if prompt_pos.dim() == 1:
-                delta = torch.arange(1, max_resp + 1, device=device, dtype=prompt_pos.dtype)
-                resp_pos = prompt_pos[-1:] + delta
-                batch.batch["position_ids"][i] = torch.cat([prompt_pos, resp_pos], dim=-1)
-            else:
-                # (..., seq) — rare; leave as-is if shapes weird
-                pass
-
-        # Actor PPO path is gated off; keep advantages / old_log_probs safe
-        if "advantages" in batch.batch:
-            batch.batch["advantages"][i].zero_()
-        if "old_log_probs" in batch.batch:
-            batch.batch["old_log_probs"][i].zero_()
-        if "ref_log_prob" in batch.batch:
-            batch.batch["ref_log_prob"][i].zero_()
-        batch.batch["feas_gate"][i] = 0.0
-        if "feas_weight" in batch.batch:
-            batch.batch["feas_weight"][i] = torch.clamp(
-                batch.batch["feas_weight"][i], min=0.5
+        if role == "r":
+            if r_start < 0:
+                failed += 1
+                continue
+            rect_ids = tokenizer.encode(text, add_special_tokens=False)
+            ids = [int(t) for t in responses[i].tolist() if int(t) != pad_id]
+            full = ids[:r_start] + rect_ids
+            if len(full) > max_resp:
+                full = full[:max_resp]
+            n = len(full)
+            new_resp[:n] = torch.tensor(full, device=device, dtype=dtype)
+            resp_attn = new_resp != pad_id
+            y_len, v_tmpl, v_len, r_tmpl = (
+                len(y_ids), len(verify_tokens), len(v_ids), len(regen_tokens)
             )
-        filled += 1
+            vs, ve = y_len + v_tmpl, y_len + v_tmpl + v_len
+            if ve <= n:
+                mt[vs:ve] = True
+            rs = ve + r_tmpl
+            if rs < n:
+                mt[rs:n] = True
+                exp[rs:n] = True
+                exp_r[rs:n] = True
+            _rebuild_row_prefix(batch, i, prompts, new_resp, resp_attn, max_resp, device)
+            batch.batch["multiturn_mask"][i] = mt
+            batch.batch["expert_token_mask"][i] = exp
+            batch.batch["expert_token_mask_v"][i] = exp_v
+            batch.batch["expert_token_mask_r"][i] = exp_r
+            if "feas_gate_r" in batch.batch:
+                batch.batch["feas_gate_r"][i] = 0.0
+            if "feas_weight_r" in batch.batch:
+                batch.batch["feas_weight_r"][i] = torch.clamp(
+                    batch.batch["feas_weight_r"][i], min=0.5
+                )
+            if "feas_gate" in batch.batch:
+                batch.batch["feas_gate"][i] = 0.0
+            filled += 1
+            filled_r += 1
+        else:
+            v_ids_new = tokenizer.encode(text, add_special_tokens=False)
+            full = y_ids + list(verify_tokens) + v_ids_new
+            if len(full) > max_resp:
+                full = full[:max_resp]
+            n = len(full)
+            new_resp[:n] = torch.tensor(full, device=device, dtype=dtype)
+            resp_attn = new_resp != pad_id
+            vs = len(y_ids) + len(verify_tokens)
+            if vs < n:
+                mt[vs:n] = True
+                exp[vs:n] = True
+                exp_v[vs:n] = True
+            _rebuild_row_prefix(batch, i, prompts, new_resp, resp_attn, max_resp, device)
+            batch.batch["multiturn_mask"][i] = mt
+            batch.batch["expert_token_mask"][i] = exp
+            batch.batch["expert_token_mask_v"][i] = exp_v
+            batch.batch["expert_token_mask_r"][i] = exp_r
+            if "feas_gate_v" in batch.batch:
+                batch.batch["feas_gate_v"][i] = 0.0
+            if "feas_weight_v" in batch.batch:
+                batch.batch["feas_weight_v"][i] = torch.clamp(
+                    batch.batch["feas_weight_v"][i], min=0.5
+                )
+            if "feas_gate" in batch.batch:
+                batch.batch["feas_gate"][i] = 0.0
+            filled += 1
+            filled_v += 1
 
     metrics["feasibility/online_gpt_filled"] = float(filled)
+    metrics["feasibility/online_gpt_filled_v"] = float(filled_v)
+    metrics["feasibility/online_gpt_filled_r"] = float(filled_r)
     metrics["feasibility/online_gpt_failed"] = float(failed)
     return batch, metrics
