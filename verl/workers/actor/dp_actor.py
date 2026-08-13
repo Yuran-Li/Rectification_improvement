@@ -245,6 +245,7 @@ class DataParallelPPOActor(BasePPOActor):
         # Feasibility-gated expert BC (optional tensors from trainer)
         for k in (
             'expert_token_mask',
+            'expert_token_mask_y',
             'expert_token_mask_v',
             'expert_token_mask_r',
             'feas_gate',
@@ -350,9 +351,12 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics['actor/kl_loss'] = kl_loss.detach().item()
                         metrics['actor/kl_coef'] = self.config.kl_loss_coef
 
-                    # Expert BC (role-aware):
+                    # Expert BC (role-aware, type-specific spans on τ_B+):
+                    #   first-shot: generator y + true-accept v (no rectifier)
+                    #   I→C: true-reject v + successful rectifier
                     #   F(s^V)>0 → weight verify expert tokens
                     #   F(s^R)>0 → weight rectify expert tokens
+                    #   F(s_A)>0 → weight generator expert tokens (row gate)
                     #   F≤0 → PPO only unless expert_bc_light>0
                     bc_loss_val = 0.0
                     bc_scale_val = 0.0
@@ -383,6 +387,14 @@ class DataParallelPPOActor(BasePPOActor):
                             wr = data['feas_weight_r'].float().view(-1, 1) if 'feas_weight_r' in data else torch.ones_like(gr)
                             expert_w = expert_w + ev * (1.0 - gv) * torch.clamp(wv, min=1.0)
                             expert_w = expert_w + er * (1.0 - gr) * torch.clamp(wr, min=1.0)
+                            if 'expert_token_mask_y' in data:
+                                ey = data['expert_token_mask_y'].float()
+                                if 'feas_gate' in data:
+                                    gy = data['feas_gate'].float().view(-1, 1)
+                                else:
+                                    gy = torch.minimum(gv, gr)
+                                wy = data['feas_weight'].float().view(-1, 1) if 'feas_weight' in data else torch.ones_like(gy)
+                                expert_w = expert_w + ey * (1.0 - gy) * torch.clamp(wy, min=1.0)
                             high_rows = (expert_w.reshape(expert_w.size(0), -1).sum(dim=-1) > 0) & (
                                 has_e.squeeze(-1) > 0
                             )

@@ -1344,6 +1344,7 @@ class RayPPOTrainer(object):
                             reward_metrics = reward_result['metrics']
                             cost_tensor = reward_result.get('cost_tensor', None)
                             expert_token_mask = reward_result.get('expert_token_mask', None)
+                            expert_token_mask_y = reward_result.get('expert_token_mask_y', None)
                             expert_token_mask_v = reward_result.get('expert_token_mask_v', None)
                             expert_token_mask_r = reward_result.get('expert_token_mask_r', None)
                             feasibility_mask = reward_result.get('feasibility_mask', None)
@@ -1358,6 +1359,7 @@ class RayPPOTrainer(object):
                             reward_metrics = {}
                             cost_tensor = None
                             expert_token_mask = None
+                            expert_token_mask_y = None
                             expert_token_mask_v = None
                             expert_token_mask_r = None
                             feasibility_mask = None
@@ -1372,6 +1374,8 @@ class RayPPOTrainer(object):
                             batch.batch['token_level_costs'] = cost_tensor
                         if expert_token_mask is not None:
                             batch.batch['expert_token_mask'] = expert_token_mask
+                        if expert_token_mask_y is not None:
+                            batch.batch['expert_token_mask_y'] = expert_token_mask_y
                         if expert_token_mask_v is not None:
                             batch.batch['expert_token_mask_v'] = expert_token_mask_v
                         if expert_token_mask_r is not None:

@@ -80,9 +80,10 @@ def transfer_same_uid_bootstrap(batch: DataProto) -> Tuple[DataProto, Dict[str, 
     """Copy successful expert rows onto infeasible same-uid siblings.
 
     With rollout.n>1, the same problem shares `uid` across n samples × windows.
-    When one sample bootstraps (verify+rectify success) and another is infeasible
-    without expert mask, overwrite the failing row with the expert trajectory so
-    actor BC can run without GPT.
+    When one sample is a final-correct positive sibling (first-shot y^C→v^accept
+    and/or W→true reject→C) and another is infeasible without expert mask,
+    overwrite the failing row with the expert trajectory so actor BC can run
+    without GPT. Masks stay type-specific: first-shot has no rectifier span.
 
     Prefer matching `window_index` when available. Call after feasibility gates /
     after critic, before actor (and before online GPT).
@@ -101,6 +102,9 @@ def transfer_same_uid_bootstrap(batch: DataProto) -> Tuple[DataProto, Dict[str, 
 
     B = batch.batch["responses"].size(0)
     has_expert = batch.batch["expert_token_mask"].reshape(B, -1).any(dim=-1)
+    for _mk in ("expert_token_mask_y", "expert_token_mask_v", "expert_token_mask_r"):
+        if _mk in batch.batch:
+            has_expert = has_expert | batch.batch[_mk].reshape(B, -1).any(dim=-1)
     need = batch.batch["feas_gate"] < 0.5
     if "window_valid" in batch.non_tensor_batch:
         valid = torch.tensor(
@@ -124,6 +128,7 @@ def transfer_same_uid_bootstrap(batch: DataProto) -> Tuple[DataProto, Dict[str, 
         for k in (
             "responses",
             "expert_token_mask",
+            "expert_token_mask_y",
             "expert_token_mask_v",
             "expert_token_mask_r",
             "multiturn_mask",
@@ -154,12 +159,43 @@ def transfer_same_uid_bootstrap(batch: DataProto) -> Tuple[DataProto, Dict[str, 
             batch.batch["old_log_probs"][i].zero_()
         if "ref_log_prob" in batch.batch:
             batch.batch["ref_log_prob"][i].zero_()
-        # keep infeasible so actor applies high BC weight
+        # Destination needed recovery: keep row infeasible for generator BC.
+        # Only open the role gates that τ_B+ actually has — first-shot has no
+        # rectifier, so do not force feas_gate_r=0 (would invent GPT/BC rectify).
         batch.batch["feas_gate"][i] = 0.0
+        src_has_y = False
+        src_has_v = False
+        src_has_r = False
+        if "expert_token_mask_y" in batch.batch:
+            src_has_y = bool(batch.batch["expert_token_mask_y"][i].any().item())
+        if "expert_token_mask_v" in batch.batch:
+            src_has_v = bool(batch.batch["expert_token_mask_v"][i].any().item())
+        if "expert_token_mask_r" in batch.batch:
+            src_has_r = bool(batch.batch["expert_token_mask_r"][i].any().item())
+        elif "expert_token_mask" in batch.batch:
+            src_has_v = bool(batch.batch["expert_token_mask"][i].any().item())
+        if "feas_gate_v" in batch.batch:
+            batch.batch["feas_gate_v"][i] = 0.0 if (src_has_v or src_has_y) else 1.0
+        if "feas_gate_r" in batch.batch:
+            batch.batch["feas_gate_r"][i] = 0.0 if src_has_r else 1.0
         if "feas_weight" in batch.batch:
             batch.batch["feas_weight"][i] = torch.clamp(
                 batch.batch["feas_weight"][i], min=0.5
             )
+        if "feas_weight_v" in batch.batch:
+            if src_has_v or src_has_y:
+                batch.batch["feas_weight_v"][i] = torch.clamp(
+                    batch.batch["feas_weight_v"][i], min=0.5
+                )
+            else:
+                batch.batch["feas_weight_v"][i] = 0.0
+        if "feas_weight_r" in batch.batch:
+            if src_has_r:
+                batch.batch["feas_weight_r"][i] = torch.clamp(
+                    batch.batch["feas_weight_r"][i], min=0.5
+                )
+            else:
+                batch.batch["feas_weight_r"][i] = 0.0
         filled += 1
 
     metrics["feasibility/bootstrap_transfer_filled"] = float(filled)

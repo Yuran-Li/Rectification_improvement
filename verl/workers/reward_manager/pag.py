@@ -15,6 +15,7 @@
 from verl import DataProto
 from verl.utils.reward_score.math_verify import compute_score as get_policy_score
 from verl.utils.reward_score.genrm_verify import get_verification_score
+from verl.workers.reward_manager.expert_spans import positive_expert_roles
 import torch
 import numpy as np
 from typing import Dict, List, Tuple, Any, Optional
@@ -39,6 +40,9 @@ class PAGRewardManager:
         where z_final=1 iff the trajectory's **final answer** is correct (else 0).
         Failure = final answer wrong — not “ever failed” / not role-error events.
         Gate F(s)=V_F(s)-ε; F(s^V)>ε → expert verify BC; F(s^R)>ε → expert rectify BC.
+        Same-UID replay of final-correct sibling τ_B+ uses type-specific masks:
+          first-shot y^C→v^accept → BC generator y + true-accept v (no rectifier);
+          W→true reject→C → BC that verify + successful rectifier.
       VF trains only at role decision boundaries — not on every token.
     """
 
@@ -148,6 +152,50 @@ class PAGRewardManager:
                 if feasibility_mask_r is not None:
                     feasibility_mask_r[row, vend] = True
 
+    @staticmethod
+    def _or_span(dst: torch.Tensor, row: int, start: int, end: int, mt: torch.Tensor) -> None:
+        if end <= start:
+            return
+        L = dst.size(-1)
+        start = max(0, start)
+        end = min(end, L, mt.numel())
+        if end <= start:
+            return
+        dst[row, start:end] |= mt[start:end]
+
+    def _paint_positive_roles(
+        self,
+        i: int,
+        *,
+        paint_y: bool,
+        paint_v: bool,
+        paint_r: bool,
+        y_start: int,
+        y_end: int,
+        v_start: int,
+        v_end: int,
+        r_start: int,
+        r_end: int,
+        mt: torch.Tensor,
+        expert_token_mask: torch.Tensor,
+        expert_token_mask_y: torch.Tensor,
+        expert_token_mask_v: torch.Tensor,
+        expert_token_mask_r: torch.Tensor,
+    ) -> bool:
+        """Paint oracle-valid spans; ∩ multiturn so context-only y is not BC'd."""
+        if paint_y:
+            self._or_span(expert_token_mask_y, i, y_start, y_end, mt)
+        if paint_v:
+            self._or_span(expert_token_mask_v, i, v_start, v_end, mt)
+        if paint_r:
+            self._or_span(expert_token_mask_r, i, r_start, r_end, mt)
+        if paint_y or paint_v or paint_r:
+            expert_token_mask[i] |= (
+                expert_token_mask_y[i] | expert_token_mask_v[i] | expert_token_mask_r[i]
+            )
+            return True
+        return False
+
     def __call__(self, data: DataProto, return_dict: bool = False) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Compute rewards for multi-turn dialogue."""
         if 'rm_scores' in data.batch:
@@ -168,6 +216,7 @@ class PAGRewardManager:
         feasibility_mask_r = torch.zeros_like(data.batch['responses'], dtype=torch.bool)
         # Expert BC spans by role (union kept as expert_token_mask)
         expert_token_mask = torch.zeros_like(data.batch['responses'], dtype=torch.bool)
+        expert_token_mask_y = torch.zeros_like(data.batch['responses'], dtype=torch.bool)
         expert_token_mask_v = torch.zeros_like(data.batch['responses'], dtype=torch.bool)
         expert_token_mask_r = torch.zeros_like(data.batch['responses'], dtype=torch.bool)
         metrics_tensors = {
@@ -367,19 +416,62 @@ class PAGRewardManager:
                     # rectify failure: said wrong (D=0) but still incorrect
                     if d_i == 0 and cur_acc < 0.5:
                         c_rect_i = 1.0
-                    if verify_result["genrm_score"] >= 0.5 and d_i == 0 and cur_acc >= 0.5:
-                        # True reject + successful I→C: role-aware expert spans
+                    py, pv, pr = positive_expert_roles(
+                        y_correct=prev_acc >= 0.5,
+                        verify_oracle=verify_result["genrm_score"] >= 0.5,
+                        verify_accept=d_i == 1,
+                        has_rectify=True,
+                        rectify_correct=cur_acc >= 0.5,
+                    )
+                    y_end_ctx = context_answer_len if context_answer_len > 0 else 0
+                    if self._paint_positive_roles(
+                        i,
+                        paint_y=py,
+                        paint_v=pv,
+                        paint_r=pr,
+                        y_start=0,
+                        y_end=y_end_ctx,
+                        v_start=0,
+                        v_end=verify_end,
+                        r_start=verify_end,
+                        r_end=policy_end,
+                        mt=multiturn_mask,
+                        expert_token_mask=expert_token_mask,
+                        expert_token_mask_y=expert_token_mask_y,
+                        expert_token_mask_v=expert_token_mask_v,
+                        expert_token_mask_r=expert_token_mask_r,
+                    ):
                         expert_bootstrap = True
-                        expert_token_mask_v[i, :verify_end] |= multiturn_mask[:verify_end]
-                        expert_token_mask_r[i, verify_end:policy_end] |= multiturn_mask[
-                            verify_end:policy_end
-                        ]
-                        expert_token_mask[i] |= expert_token_mask_v[i] | expert_token_mask_r[i]
 
                     u_v = cur_acc - prev_acc
                 else:
                     u_v = 0.0
                     cur_acc = prev_acc
+                    py, pv, pr = positive_expert_roles(
+                        y_correct=prev_acc >= 0.5,
+                        verify_oracle=verify_result["genrm_score"] >= 0.5,
+                        verify_accept=d_i == 1,
+                        has_rectify=False,
+                    )
+                    y_end_ctx = context_answer_len if context_answer_len > 0 else 0
+                    if self._paint_positive_roles(
+                        i,
+                        paint_y=py,
+                        paint_v=pv,
+                        paint_r=pr,
+                        y_start=0,
+                        y_end=y_end_ctx,
+                        v_start=0,
+                        v_end=verify_end,
+                        r_start=0,
+                        r_end=0,
+                        mt=multiturn_mask,
+                        expert_token_mask=expert_token_mask,
+                        expert_token_mask_y=expert_token_mask_y,
+                        expert_token_mask_v=expert_token_mask_v,
+                        expert_token_mask_r=expert_token_mask_r,
+                    ):
+                        expert_bootstrap = True
 
                 if self.utility_aware:
                     r_v = float(verify_result["genrm_score"]) + self.beta * u_v
@@ -472,6 +564,33 @@ class PAGRewardManager:
                         c_f_i = max(c_f_i, step_c_f)
                         turn_costs.append(step_c_f)
                         metrics_tensors['c_f_discounted'][i] += (self.gamma_f ** (turn - 1)) * step_c_f
+                        py, pv, pr = positive_expert_roles(
+                            y_correct=prev_acc >= 0.5,
+                            verify_oracle=verify_result["genrm_score"] >= 0.5,
+                            verify_accept=d_i == 1,
+                            has_rectify=False,
+                        )
+                        if turn > 1:
+                            py = False  # later true-accept: do not treat as first-shot generator
+                        y0_end = turn_boundaries[0]
+                        if self._paint_positive_roles(
+                            i,
+                            paint_y=py,
+                            paint_v=pv,
+                            paint_r=pr,
+                            y_start=0,
+                            y_end=y0_end,
+                            v_start=verify_start,
+                            v_end=verify_end,
+                            r_start=0,
+                            r_end=0,
+                            mt=multiturn_mask,
+                            expert_token_mask=expert_token_mask,
+                            expert_token_mask_y=expert_token_mask_y,
+                            expert_token_mask_v=expert_token_mask_v,
+                            expert_token_mask_r=expert_token_mask_r,
+                        ):
+                            expert_bootstrap = True
                         break
 
                     if self.is_only_genrm:
@@ -516,16 +635,32 @@ class PAGRewardManager:
                     if not slide_packed:
                         answer_ends.append(policy_end - 1)
                     metrics_tensors['c_f_discounted'][i] += (self.gamma_f ** (turn - 1)) * step_c_f
-                    if verify_result["genrm_score"] >= 0.5 and d_i == 0 and cur_acc >= 0.5:
-                        # True reject + successful I→C: role-aware expert spans
+                    py, pv, pr = positive_expert_roles(
+                        y_correct=prev_acc >= 0.5,
+                        verify_oracle=verify_result["genrm_score"] >= 0.5,
+                        verify_accept=d_i == 1,
+                        has_rectify=True,
+                        rectify_correct=cur_acc >= 0.5,
+                    )
+                    y0_end = turn_boundaries[0]
+                    if self._paint_positive_roles(
+                        i,
+                        paint_y=py,
+                        paint_v=pv,
+                        paint_r=pr,
+                        y_start=0,
+                        y_end=y0_end,
+                        v_start=verify_start,
+                        v_end=verify_end,
+                        r_start=policy_start,
+                        r_end=policy_end,
+                        mt=multiturn_mask,
+                        expert_token_mask=expert_token_mask,
+                        expert_token_mask_y=expert_token_mask_y,
+                        expert_token_mask_v=expert_token_mask_v,
+                        expert_token_mask_r=expert_token_mask_r,
+                    ):
                         expert_bootstrap = True
-                        expert_token_mask_v[i, verify_start:verify_end] |= multiturn_mask[
-                            verify_start:verify_end
-                        ]
-                        expert_token_mask_r[i, policy_start:policy_end] |= multiturn_mask[
-                            policy_start:policy_end
-                        ]
-                        expert_token_mask[i] |= expert_token_mask_v[i] | expert_token_mask_r[i]
 
                     prev_acc = cur_acc
                     gt_judge = cur_acc >= 0.5
@@ -570,6 +705,12 @@ class PAGRewardManager:
 
             acc_t1 = float(reward_extra_info["acc"][-1])
             acc_final = acc_t2 if revised else acc_t1
+            if float(acc_final) < 0.5:
+                expert_token_mask[i] = False
+                expert_token_mask_y[i] = False
+                expert_token_mask_v[i] = False
+                expert_token_mask_r[i] = False
+                expert_bootstrap = False
             reward_extra_info["ground_truth"].append(ground_truth)
             reward_extra_info["data_source"].append(data_source)
             reward_extra_info["acc_t1"].append(float(acc_t1))
@@ -622,6 +763,12 @@ class PAGRewardManager:
             metrics['feasibility/c_f_discounted_mean'] = metrics_tensors['c_f_discounted'].mean().item()
         if reward_extra_info.get("expert_bootstrap"):
             metrics['feasibility/expert_bootstrap_rate'] = float(np.mean(reward_extra_info["expert_bootstrap"]))
+        metrics['feasibility/expert_first_shot_rate'] = float(
+            expert_token_mask_y.reshape(expert_token_mask_y.size(0), -1).any(dim=-1).float().mean().item()
+        )
+        metrics['feasibility/expert_i2c_rate'] = float(
+            expert_token_mask_r.reshape(expert_token_mask_r.size(0), -1).any(dim=-1).float().mean().item()
+        )
         n_route = feasibility_mask.float().sum().item()
         metrics['feasibility/n_routing_states'] = n_route
         if n_route > 0:
@@ -642,6 +789,7 @@ class PAGRewardManager:
                 "feasibility_mask_r": feasibility_mask_r,
                 "c_f_discounted": metrics_tensors['c_f_discounted'],
                 "expert_token_mask": expert_token_mask,
+                "expert_token_mask_y": expert_token_mask_y,
                 "expert_token_mask_v": expert_token_mask_v,
                 "expert_token_mask_r": expert_token_mask_r,
                 "reward_extra_info": reward_extra_info,

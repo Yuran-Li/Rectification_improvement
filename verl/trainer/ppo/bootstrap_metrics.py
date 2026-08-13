@@ -10,7 +10,8 @@ split by verify-state s^V vs rectify-state s^R.
 
 Successful sibling (primary) = z_final=1 (G_F=0 on that sibling).
 Transferable expert (secondary) = sibling already has role expert_token_mask
-(true-reject + I→C in pag.py) — what transfer_same_uid_bootstrap actually copies.
+(first-shot y^C→v^accept and/or true-reject+I→C in pag.py) — what
+transfer_same_uid_bootstrap actually copies. First-shot has no rectifier span.
 """
 from __future__ import annotations
 
