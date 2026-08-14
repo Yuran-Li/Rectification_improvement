@@ -61,6 +61,10 @@ class PAGRewardManager:
         self.beta = float(config.get('beta', 0.5))
         # Turn-level γ_F for C_F(τ)=Σ_i γ_F^{i-1} c_i^F (correction turns, not tokens)
         self.gamma_f = float(config.get('gamma_f', 0.9))
+        # Expert BC role control: whether first-shot correct siblings also BC the
+        # verifier accept span.  Set False to keep verifier BC gated to I→C only,
+        # avoiding over-reinforcing "accept" from V_F-flagged high-risk states.
+        self.bc_verifier_accept = bool(config.get('bc_verifier_accept', True))
 
     def _turn_boundaries(self, multiturn_mask: torch.Tensor) -> List[int]:
         """Return end indices (exclusive) of each contiguous True run in multiturn_mask.
@@ -422,6 +426,7 @@ class PAGRewardManager:
                         verify_accept=d_i == 1,
                         has_rectify=True,
                         rectify_correct=cur_acc >= 0.5,
+                        bc_verifier_accept=self.bc_verifier_accept,
                     )
                     y_end_ctx = context_answer_len if context_answer_len > 0 else 0
                     if self._paint_positive_roles(
@@ -452,6 +457,7 @@ class PAGRewardManager:
                         verify_oracle=verify_result["genrm_score"] >= 0.5,
                         verify_accept=d_i == 1,
                         has_rectify=False,
+                        bc_verifier_accept=self.bc_verifier_accept,
                     )
                     y_end_ctx = context_answer_len if context_answer_len > 0 else 0
                     if self._paint_positive_roles(
@@ -569,6 +575,7 @@ class PAGRewardManager:
                             verify_oracle=verify_result["genrm_score"] >= 0.5,
                             verify_accept=d_i == 1,
                             has_rectify=False,
+                            bc_verifier_accept=self.bc_verifier_accept,
                         )
                         if turn > 1:
                             py = False  # later true-accept: do not treat as first-shot generator
@@ -641,6 +648,7 @@ class PAGRewardManager:
                         verify_accept=d_i == 1,
                         has_rectify=True,
                         rectify_correct=cur_acc >= 0.5,
+                        bc_verifier_accept=self.bc_verifier_accept,
                     )
                     y0_end = turn_boundaries[0]
                     if self._paint_positive_roles(

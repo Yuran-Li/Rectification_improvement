@@ -29,6 +29,9 @@ export PYTHONNOUSERSITE=1
 
 math500="$REPO_ROOT/datasets/math500.parquet"
 math7500="$REPO_ROOT/datasets/math7500.parquet"
+# PAG 7B trains on DAPO17K; 1.5B used MATH7500. Override: TRAIN_FILE=$math7500
+dapo17k="$REPO_ROOT/datasets/dapo17k.parquet"
+TRAIN_FILE="${TRAIN_FILE:-$dapo17k}"
 
 PROJECT_NAME="${PROJECT_NAME:-Rectification_Feasibility}"
 CKPT_PATH="${CKPT_PATH:-$REPO_ROOT/checkpoints}"
@@ -54,7 +57,7 @@ dual_critic="${DUAL_CRITIC:-True}"
 use_lagrangian="${USE_LAGRANGIAN:-False}"
 critic_num_labels="${CRITIC_NUM_LABELS:-2}"
 # ε in F(s)=V_F(s)-ε. Prefer FEAS_THRESHOLD; COST_BUDGET kept as alias.
-feas_threshold="${FEAS_THRESHOLD:-${COST_BUDGET:-0.3}}"
+feas_threshold="${FEAS_THRESHOLD:-${COST_BUDGET:-0.5}}"
 cost_budget="$feas_threshold"
 # First N steps: no infeasible BC/GPT; V_F still trains
 constraint_warmup="${CONSTRAINT_WARMUP:-15}"
@@ -62,6 +65,10 @@ constraint_warmup="${CONSTRAINT_WARMUP:-15}"
 expert_bc="${EXPERT_BC:-True}"
 expert_bc_coef="${EXPERT_BC_COEF:-2.0}"
 expert_bc_light="${EXPERT_BC_LIGHT:-0.0}"
+# BC role control: False = first-shot sibling replays solution only (not verifier
+# accept); prevents over-reinforcing "accept" from V_F-flagged high-risk states.
+# I→C true-reject verifier BC is always active regardless of this flag.
+bc_verifier_accept="${BC_VERIFIER_ACCEPT:-False}"
 expert_buffer_capacity="${EXPERT_BUFFER_CAPACITY:-256}"
 # Same-problem bootstrap: problem-conditioned positive replay (n>1). No API.
 bootstrap_same_uid="${BOOTSTRAP_SAME_UID:-True}"
@@ -72,10 +79,10 @@ online_gpt_max_per_step="${ONLINE_GPT_MAX_PER_STEP:-4}"
 online_gpt_prefer_bootstrap="${ONLINE_GPT_PREFER_BOOTSTRAP:-True}"
 norm_type="${NORM_TYPE:-role}"
 
-TRAIN_BS="${TRAIN_BS:-32}"
-MINI_BS="${MINI_BS:-32}"
+TRAIN_BS="${TRAIN_BS:-64}"
+MINI_BS="${MINI_BS:-64}"
 MAX_PROMPT="${MAX_PROMPT:-1024}"
-MAX_RESP="${MAX_RESP:-1024}"
+MAX_RESP="${MAX_RESP:-1536}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-20}"
 # Optional hard stop (overrides epochs). Example: TOTAL_TRAINING_STEPS=25
 TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-}"
@@ -94,15 +101,20 @@ if [[ -n "${TOTAL_TRAINING_STEPS}" ]]; then
   echo "[run] total_training_steps=$TOTAL_TRAINING_STEPS"
 fi
 NNODES="${NNODES:-1}"
-# Align train sampling with val (fewer degenerate garbage gens)
-TEMPERATURE="${TEMPERATURE:-0.6}"
-TOP_P="${TOP_P:-0.95}"
+# PAG paper Appendix B: train T=1.0 / top-p=1.0; eval Avg@32 uses T=0.6 / top-p=0.95 / top-k=-1.
+TEMPERATURE="${TEMPERATURE:-1.0}"
+TOP_P="${TOP_P:-1.0}"
 TOP_K="${TOP_K:--1}"
+VAL_TEMPERATURE="${VAL_TEMPERATURE:-0.6}"
+VAL_TOP_P="${VAL_TOP_P:-0.95}"
+VAL_TOP_K="${VAL_TOP_K:--1}"
 # Hybrid engine: free vLLM KV/cudagraph before actor log_prob (needs enforce_eager).
 # Previous default free_cache_engine=False + util=0.55 OOMs after val→train on 48G.
+# util=0.40 → KV cache ~12GB on 48G GPU; lower to 0.35 if long multi-turn seqs crash
+# with "CUDA illegal memory access" in vLLM sampler (KV overflow deferred error).
 ENFORCE_EAGER="${ENFORCE_EAGER:-True}"
 FREE_CACHE_ENGINE="${FREE_CACHE_ENGINE:-True}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.40}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.35}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
 PPO_MAX_TOKEN_LEN="${PPO_MAX_TOKEN_LEN:-12288}"
 
@@ -114,7 +126,7 @@ fi
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=gae \
-    data.train_files=[$math7500] \
+    data.train_files=[$TRAIN_FILE] \
     data.val_files="['$math500']" \
     data.filter_overlong_prompts=True \
     data.train_batch_size=$TRAIN_BS \
@@ -150,13 +162,14 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.slide_window=$slide_window \
     actor_rollout_ref.rollout.val_kwargs.n=4 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.rollout.val_kwargs.top_k=$TOP_K \
-    actor_rollout_ref.rollout.val_kwargs.top_p=$TOP_P \
-    actor_rollout_ref.rollout.val_kwargs.temperature=$TEMPERATURE \
+    actor_rollout_ref.rollout.val_kwargs.top_k=$VAL_TOP_K \
+    actor_rollout_ref.rollout.val_kwargs.top_p=$VAL_TOP_P \
+    actor_rollout_ref.rollout.val_kwargs.temperature=$VAL_TEMPERATURE \
     actor_rollout_ref.rollout.val_kwargs.num_turns=$num_turns \
     reward_model.utility_aware=$utility_aware \
     reward_model.alpha=$alpha \
     reward_model.beta=$beta \
+    reward_model.bc_verifier_accept=$bc_verifier_accept \
     critic.optim.lr=2e-6 \
     critic.use_dynamic_bsz=True \
     critic.model.use_remove_padding=True \

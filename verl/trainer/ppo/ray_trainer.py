@@ -24,7 +24,7 @@ from enum import Enum
 from pprint import pprint
 from typing import Type, Dict
 from copy import deepcopy
-from collections import defaultdict
+from collections import defaultdict, deque
 from functools import partial
 from tqdm import tqdm
 
@@ -466,6 +466,101 @@ class RayPPOTrainer(object):
 
         self._validate_config()
         self._create_dataloader()
+        # Rolling window for per-step health monitoring (last 15 steps)
+        self._health_history: deque = deque(maxlen=15)
+
+    def _monitor_health(self, metrics: dict) -> None:
+        """Per-step health summary with WARN on critical threshold crossings.
+
+        Tracks the four curves for fixed-ε experiments:
+          gate/gate_rate    — automatic curriculum (should naturally ↓ as V_F↓)
+          vf_audit/E_vf     — V_F mean level (should ↓ as policy improves)
+          gate/fail_gap     — critic discriminability (must stay > 0)
+          multiturn/TPR     — verifier health (must not collapse)
+        """
+        NaN = float('nan')
+        snap = {
+            'gate_rate': metrics.get('gate/gate_rate',       NaN),
+            'fail_gap':  metrics.get('gate/fail_gap',        NaN),
+            'e_vf':      metrics.get('vf_audit/E_vf',        NaN),
+            'tpr':       metrics.get('multiturn/TPR',        NaN),
+            'boot_cov':  metrics.get('bootstrap/coverage',   NaN),
+        }
+        self._health_history.append(snap)
+        step = self.global_steps
+
+        WARN  = "\033[33m[HEALTH WARN]\033[0m"
+        GREEN = "\033[32m[HEALTH]\033[0m"
+        warn_msgs = []
+
+        # 1. Critic discriminability: fail_gap must stay positive
+        fg = snap['fail_gap']
+        if not np.isnan(fg):
+            if fg < 0.02:
+                warn_msgs.append(
+                    f"fail_gap={fg:.3f}<0.02 → critic 区分度几乎丧失，V_F 可能退化为常数"
+                )
+            elif fg < 0.05:
+                warn_msgs.append(
+                    f"fail_gap={fg:.3f}<0.05 → critic 区分度偏弱，关注后续是否持续下降"
+                )
+
+        # 2. Verifier collapse: TPR collapsing toward 0
+        tpr = snap['tpr']
+        if not np.isnan(tpr):
+            if tpr < 0.25:
+                warn_msgs.append(
+                    f"TPR={tpr:.3f}<0.25 → verifier 疑似塌缩为 always-correct"
+                )
+            elif tpr < 0.40:
+                warn_msgs.append(
+                    f"TPR={tpr:.3f}<0.40 → verifier 区分度下降，观察是否持续"
+                )
+
+        # 3. Gate stuck near 1.0 after warmup → ε may be too low or V_F biased high
+        gr = snap['gate_rate']
+        if not np.isnan(gr) and step > self.constraint_warmup + 5:
+            if gr > 0.95:
+                warn_msgs.append(
+                    f"gate_rate={gr:.3f}>0.95 — gate 几乎全开（V_F 整体偏高），"
+                    f"若持续请考虑 ε↑ 或确认 critic 是否收敛"
+                )
+
+        # 4. Gate closed too early → BC signal disappears
+        if not np.isnan(gr) and step > self.constraint_warmup + 20:
+            if gr < 0.05:
+                warn_msgs.append(
+                    f"gate_rate={gr:.3f}<0.05 — gate 几乎全关，BC signal 消失；"
+                    f"若 W2C 未饱和则检查 V_F 是否过度左移"
+                )
+
+        # 5. V_F rising trend (5-step window) → policy regressing or critic reset
+        ev = snap['e_vf']
+        if len(self._health_history) >= 5 and not np.isnan(ev):
+            old_ev = self._health_history[-5]['e_vf']
+            if not np.isnan(old_ev) and (ev - old_ev) > 0.05:
+                warn_msgs.append(
+                    f"E_vf 5步内上升 {ev - old_ev:+.3f} ({old_ev:.3f}→{ev:.3f}) "
+                    f"— V_F 逆升，policy 可能退步或 critic 被重置"
+                )
+
+        # 6. Bootstrap coverage stuck at 0 after warmup
+        bc = snap['boot_cov']
+        if not np.isnan(bc) and step > self.constraint_warmup + 10:
+            if bc < 0.01:
+                warn_msgs.append(
+                    f"bootstrap/coverage={bc:.3f}≈0 — 无法找到正确 sibling，"
+                    f"检查 n_samples 或训练数据难度"
+                )
+
+        prefix = WARN if warn_msgs else GREEN
+        print(
+            f"{prefix} step={step:4d} "
+            f"gate={gr:.3f} E_vf={ev:.3f} fail_gap={fg:.3f} "
+            f"TPR={tpr:.3f} boot={bc:.3f}"
+        )
+        for w in warn_msgs:
+            print(f"  └─ {WARN} {w}")
 
     def _constraint_active(self) -> bool:
         """True once past warmup (infeasible BC/GPT; optional Lagrangian ascent)."""
@@ -1680,6 +1775,7 @@ class RayPPOTrainer(object):
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+                self._monitor_health(metrics)
 
                 if is_last_step:
                     pprint(f'Final validation metrics: {last_val_metrics}')

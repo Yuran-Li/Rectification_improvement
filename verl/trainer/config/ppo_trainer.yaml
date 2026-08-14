@@ -201,6 +201,10 @@ reward_model:
   alpha: 1.0   # rectify benefit weight
   beta: 0.5    # verify utility weight
   gamma_f: 0.9 # turn-level γ_F: C_F=Σ_i γ^{i-1} c_i^F and G_F at answer states
+  # BC role control: False = first-shot sibling only replays solution (y), not
+  # verifier accept; prevents over-reinforcing "accept" from V_F-flagged high-risk
+  # states. I→C true-reject verifier BC is unaffected.
+  bc_verifier_accept: True
   compute_score: null
 
 custom_reward_function:
