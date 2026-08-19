@@ -25,7 +25,7 @@ math500="$REPO_ROOT/datasets/math500.parquet"
 math7500="$REPO_ROOT/datasets/math7500.parquet"
 dapo17k="$REPO_ROOT/datasets/dapo17k.parquet"
 
-PROJECT_NAME='PAG'
+PROJECT_NAME='PAG-critique-utility'
 CKPT_PATH="${CKPT_PATH:-$REPO_ROOT/checkpoints}"
 # Hub id or local snapshot path. Override MODEL_PATH for a local cache.
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}"

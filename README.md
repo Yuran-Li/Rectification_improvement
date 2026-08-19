@@ -8,7 +8,7 @@
 </div>
 
 ## News
-- **[2026/08/18]** Critique-informativeness PPO: split verifier rewards, same-\(y_0\) generic counterfactual, pair logging (`P(CW)`, CER)
+- **[2026/08/18]** Critique-informativeness PPO: split verifier rewards, same-`y0` generic counterfactual, pair logging (`P(CW)`, CER)
 - **[2025/06/27]** 🎉 Code released
 - **[2025/06/13]** 🎉 [HomePage](https://jackory.github.io/pag/) released
 
@@ -50,51 +50,51 @@ Note that this is only for debugging purposes.
 
 ## Current training changes
 
-These changes sit on top of the original PAG loop (`n=4` independent \(y_0\) samples per prompt). They are **on** in `quick_start/run_pag_local.sh` and `quick_start/qwen1p5b_pag.sh`.
+These changes sit on top of the original PAG loop (`n=4` independent `y0` samples per prompt). They are **on** in `quick_start/run_pag_local.sh` and `quick_start/qwen1p5b_pag.sh`.
 
 ### What changed
 
-1. **Verifier user prompt** (`verl/utils/pag_prompts.py`): one generation that writes a short error critique, then a hard closer `The answer is wrong.` / `The answer is correct.`. No full re-solve and no `\\boxed{}` in verify.
+1. **Verifier user prompt** (`verl/utils/pag_prompts.py`): one generation that writes a short error critique, then a hard closer `The answer is wrong.` / `The answer is correct.`. No full re-solve and no `\boxed{}` in verify.
 2. **Split verifier rewards** (`reward_model.split_verify_reward=True`):
-   - \(R_{\mathrm{disc}}\) = GenRM score on the last **verdict** token.
-   - Usefulness on the last **feedback** token (see \(R_{\mathrm{critique}}\) below).
-   - GAE uses \(\gamma=1,\lambda=1\). Verdict-last placement credits feedback+verdict; feedback-last placement does **not** flow into the rectifier.
-3. **Generic counterfactual fork** (`actor_rollout_ref.rollout.generic_counterfactual=True`): if a row would already rectify (same `should_revise` gate as PAG, default = verifier says `wrong`), sample one extra recovery from **that same** \(y_0\):
+   - `R_disc` = GenRM score on the last **verdict** token.
+   - Usefulness on the last **feedback** token (see `R_critique` below).
+   - GAE uses `γ=1`, `λ=1`. Verdict-last placement credits feedback+verdict; feedback-last placement does **not** flow into the rectifier.
+3. **Generic counterfactual fork** (`actor_rollout_ref.rollout.generic_counterfactual=True`): if a row would already rectify (same `should_revise` gate as PAG, default = verifier says `wrong`), sample one extra recovery from **that same** `y0`:
 
    `x → y0 → VERIFY_USER → v_generic → REGENERATE_USER → y_generic`
 
-   `v_generic` is the fixed string `GENERIC_CRITIQUE` (format-matched: non-specific feedback + `The answer is wrong.`). Do **not** resample \(y_0\). Do **not** pair across rollout indices. `n` stays 4; this is not `n=8`.
+   `v_generic` is the fixed string `GENERIC_CRITIQUE` (format-matched: non-specific feedback + `The answer is wrong.`). Do **not** resample `y0`. Do **not** pair across rollout indices. `n` stays 4; this is not `n=8`.
 
-4. **\(y_{\mathrm{generic}}\) is not a PPO sequence.** It is stored on the self row (`generic_response`, `traj_id`) and used only to score the contrast. Actor/critic still see only `x → y0 → v_self → y_self`. `include_generic_in_actor=False` (True is not implemented).
+4. **`y_generic` is not a PPO sequence.** It is stored on the self row (`generic_response`, `traj_id`) and used only to score the contrast. Actor/critic still see only `x → y0 → v_self → y_self`. `include_generic_in_actor=False` (True is not implemented).
 
 ### Rewards on the self row
 
 | Signal | Token | Formula |
 |--------|--------|---------|
-| \(R_{\mathrm{disc}}\) | last verdict token | GenRM score (correct/wrong vs GT) |
-| \(R_{\mathrm{critique}}\) | last self-feedback token | \(R_y(y_{\mathrm{self}}) - R_y(y_{\mathrm{generic}})\) \(\in \{+1,0,-1\}\) |
-| \(R_{\mathrm{rect}}\) | last rectifier token | \(R_y(y_{\mathrm{self}}) + \texttt{rs\_coef}\cdot\Delta_{\mathrm{self}}\) (`policy_rs` unchanged) |
+| `R_disc` | last verdict token | GenRM score (correct/wrong vs GT) |
+| `R_critique` | last self-feedback token | `R_y(y_self) - R_y(y_generic)` in `{+1, 0, -1}` |
+| `R_rect` | last rectifier token | `R_y(y_self) + rs_coef * Δ_self` (`policy_rs` unchanged) |
 
-No rectify ⇒ no generic fork ⇒ no \(R_{\mathrm{critique}}\). User-template gaps (`multiturn_mask=False`) still zero GAE into \(y_0\).
+No rectify ⇒ no generic fork ⇒ no `R_critique`. User-template gaps (`multiturn_mask=False`) still zero GAE into `y0`.
 
 ### Pair logging (train step + full val window)
 
-Among **forked** rows only, label \((\mathrm{self},\mathrm{generic})\):
+Among **forked** rows only, label `(self, generic)`:
 
-| Cell | Meaning | \(R_{\mathrm{cf}}\) |
-|------|---------|---------------------|
-| CW | self correct, generic wrong | \(+1\) |
-| CC | both correct | \(0\) |
-| WW | both wrong | \(0\) |
-| WC | self wrong, generic correct | \(-1\) |
+| Cell | Meaning | `R_cf` |
+|------|---------|--------|
+| CW | self correct, generic wrong | +1 |
+| CC | both correct | 0 |
+| WW | both wrong | 0 |
+| WC | self wrong, generic correct | −1 |
 
 Logged as `multiturn/*` (train) and `val/multiturn/*` (aggregated over the whole validation pass):
 
 - `p_cw`, `p_cc`, `p_ww`, `p_wc`
-- `e_r_cf` = \(P(\mathrm{CW})-P(\mathrm{WC})\)
-- `critique_exclusive_rate` = \(\mathrm{CW}/(\mathrm{CW}+\mathrm{CC})\) (omitted if self never succeeds)
+- `e_r_cf` = `P(CW) - P(WC)`
+- `critique_exclusive_rate` = `CW / (CW + CC)` (omitted if self never succeeds)
 
-The method target is **\(P(\mathrm{CW})\uparrow\)** (specific critique adds corrective information), not only self accuracy. Rising `p_cc` with falling CER usually means the rectifier got stronger, not that critiques got more informative.
+The method target is **`P(CW)` ↑** (specific critique adds corrective information), not only self accuracy. Rising `p_cc` with falling CER usually means the rectifier got stronger, not that critiques got more informative.
 
 ### Launch
 
