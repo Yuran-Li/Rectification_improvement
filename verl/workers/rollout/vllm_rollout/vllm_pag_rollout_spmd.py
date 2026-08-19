@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-vLLM Genrm Rollout - Multi-turn generation logic:
-1. First turn: prompt -> answer
-2. Verify previous answer -> correct/wrong judgment
-3. If "wrong", next turn: request regeneration -> new answer
-4. Repeat until specified turns or GenRM considers answer correct
+vLLM PAG Rollout - Multi-turn generation logic:
+1. First turn: prompt -> answer (y0)
+2. Verify previous answer -> correct/wrong judgment (v_self)
+3. If "wrong", next turn: request regeneration -> new answer (y_self)
+4. Optional generic_counterfactual: if a row rectifies, fork one recovery
+   from the same y0 with a fixed generic critique and sample y_generic.
+   y_generic is attached on the self row and does not enter the actor batch.
 """
 import numpy as np
 import re
+import uuid
 from typing import List
 from contextlib import contextmanager
 from omegaconf import DictConfig
@@ -30,6 +33,7 @@ from torch import nn
 from typing import Any, Union
 from verl import DataProto
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
+from verl.utils.pag_prompts import GENERIC_CRITIQUE, REGENERATE_USER, VERIFY_USER
 from verl.utils.reward_score.math_verify import compute_score as get_policy_score
 from verl.workers.rollout.base import BaseRollout
 from vllm.distributed import parallel_state as vllm_ps
@@ -112,9 +116,17 @@ class vLLMPAGRollout(vLLMRollout):
         
         # Prompt templates
         self.prompt_templates = {
-            "verify": "Check the math solution step-by-step. If you find a mistake: state the wrong step, explain why it's wrong, and end your response with 'The answer is wrong'. If all steps are correct, end your response with 'The answer is correct'.",
-            "regenerate": "You indicated that your previous answer was wrong. Please provide the correct solution to the math problem."
+            "verify": VERIFY_USER,
+            "regenerate": REGENERATE_USER,
         }
+        self.generic_counterfactual = bool(config.get("generic_counterfactual", False))
+        self.include_generic_in_actor = bool(config.get("include_generic_in_actor", False))
+        if self.include_generic_in_actor:
+            raise NotImplementedError(
+                "include_generic_in_actor=True is not implemented; "
+                "generic recovery stays attached on the self row only."
+            )
+        self.generic_critique_token_ids = self._encode_assistant_text(GENERIC_CRITIQUE)
 
         # Calculate max model length
         if self.end_with_verifer:
@@ -164,6 +176,14 @@ class vLLMPAGRollout(vLLMRollout):
         print(f"Token IDs for 'correct': {self.correct_token_ids}")
         print(f"Token IDs for 'wrong': {self.wrong_token_ids}")
 
+    def _encode_assistant_text(self, text):
+        """Tokenize a fixed assistant turn (generic critique) and close with EOS."""
+        ids = self.tokenizer.encode(text, add_special_tokens=False)
+        eos = self.tokenizer.eos_token_id
+        if eos is not None and (len(ids) == 0 or ids[-1] != eos):
+            ids = list(ids) + [eos]
+        return list(ids)
+
     def _find_token_ids_for_word(self, word):
         """Find all possible token IDs representing the word"""
         variants = [word, f" {word}"]
@@ -199,7 +219,7 @@ class vLLMPAGRollout(vLLMRollout):
 
     def _extract_judgment_and_probability(self, output, text):
         """Extract 'correct' or 'wrong' judgment and token probability"""
-        pattern = r"The answer is (correct|wrong)\.$"
+        pattern = r"The answer is (correct|wrong)\.\s*$"
         matches = []
         
         try:
@@ -275,6 +295,10 @@ class vLLMPAGRollout(vLLMRollout):
         final_generation_turn = [0] * batch_size
         verify_probs = [0] * batch_size
         full_verify_probs = [[] for _ in range(batch_size)]
+        traj_ids = [str(uuid.uuid4()) for _ in range(batch_size)]
+        recovery_branch = ["self"] * batch_size
+        parent_traj_id = list(traj_ids)
+        generic_response = [""] * batch_size
         verify_tokens = self._get_template_tokens("verify")
         regenerate_tokens = self._get_template_tokens("regenerate")
 
@@ -451,6 +475,43 @@ class vLLMPAGRollout(vLLMRollout):
                 current_positions[original_idx] = pos + response_length
                 turns_positions[original_idx].append(pos + response_length)
                 final_generation_turn[original_idx] = answer_turn
+
+            # Generic counterfactual: same y0 + fixed critique, sample y_generic.
+            # Not written into combined_response; attached on the self row.
+            # Validation also forks: needed for val-window P(CW)/CER (generic still not in actor).
+            if self.generic_counterfactual and answer_turn == 1:
+                generic_inputs = []
+                for original_idx in active_samples:
+                    y0_end = turns_positions[original_idx][1]
+                    y0_tokens = combined_response[original_idx, :y0_end].tolist()
+                    history = (
+                        current_inputs[original_idx]
+                        + y0_tokens
+                        + verify_tokens
+                        + self.generic_critique_token_ids
+                        + regenerate_tokens
+                    )
+                    generic_inputs.append(history)
+                with self.update_sampling_params(**kwargs):
+                    generic_outputs = self.inference_engine.generate(
+                        prompts=None,
+                        sampling_params=self.sampling_params,
+                        prompt_token_ids=generic_inputs,
+                        use_tqdm=False
+                    )
+                generic_token_lists = [
+                    output.outputs[sample_id].token_ids
+                    for output in generic_outputs
+                    for sample_id in range(len(output.outputs))
+                ]
+                assert len(generic_token_lists) == len(active_samples), (
+                    f"generic outputs {len(generic_token_lists)} != "
+                    f"active samples {len(active_samples)}"
+                )
+                for i, original_idx in enumerate(active_samples):
+                    generic_response[original_idx] = self.tokenizer.decode(
+                        generic_token_lists[i], skip_special_tokens=True
+                    )
         
         # Update attention_mask and position_ids
         seq = torch.cat([idx, combined_response], dim=-1)
@@ -474,7 +535,11 @@ class vLLMPAGRollout(vLLMRollout):
             self.inference_engine.free_cache_engine()
             
         return DataProto(batch=batch, non_tensor_batch={
-            "final_generation_turn": np.array(final_generation_turn, dtype=np.int32), 
+            "final_generation_turn": np.array(final_generation_turn, dtype=np.int32),
             "verify_probs": np.array(verify_probs, dtype=np.float32),
-            "full_verify_probs": np.array(full_verify_probs, dtype=object)
+            "full_verify_probs": np.array(full_verify_probs, dtype=object),
+            "traj_id": np.array(traj_ids, dtype=object),
+            "recovery_branch": np.array(recovery_branch, dtype=object),
+            "parent_traj_id": np.array(parent_traj_id, dtype=object),
+            "generic_response": np.array(generic_response, dtype=object),
         }) 

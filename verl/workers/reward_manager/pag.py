@@ -14,17 +14,82 @@
 
 from verl import DataProto
 from verl.utils.reward_score.math_verify import compute_score as get_policy_score
-from verl.utils.reward_score.genrm_verify import get_verification_score
+from verl.utils.reward_score.genrm_verify import (
+    find_feedback_last_token_index,
+    get_verification_score,
+)
 import torch
 import numpy as np
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 from collections import defaultdict
+
+
+def critique_advantage(acc_self: float, acc_generic: float) -> float:
+    """R_critique = R_y(y_self) - R_y(y_generic). With 0/1 acc this is {+1, 0, -1}."""
+    return float(acc_self) - float(acc_generic)
+
+
+def pair_cell_label(acc_self: float, acc_generic: float) -> str:
+    """Four-way (self, generic) cell: CW, CC, WW, WC. C := acc >= 0.5."""
+    self_c = float(acc_self) >= 0.5
+    gen_c = float(acc_generic) >= 0.5
+    if self_c and not gen_c:
+        return "CW"
+    if self_c and gen_c:
+        return "CC"
+    if (not self_c) and (not gen_c):
+        return "WW"
+    return "WC"
+
+
+def paired_outcome_metrics(cells) -> Dict[str, float]:
+    """P(CW/CC/WW/WC), E[R_cf]=P(CW)-P(WC), CritiqueExclusiveRate=CW/(CW+CC).
+
+    `cells` are forked samples only. CritiqueExclusiveRate is defined only when
+    self succeeded at least once (CW+CC > 0).
+    """
+    counts = {"CW": 0, "CC": 0, "WW": 0, "WC": 0}
+    for cell in cells:
+        if cell in counts:
+            counts[cell] += 1
+    n = int(sum(counts.values()))
+    metrics: Dict[str, float] = {
+        "pair_n": float(n),
+        "pair_n_cw": float(counts["CW"]),
+        "pair_n_cc": float(counts["CC"]),
+        "pair_n_ww": float(counts["WW"]),
+        "pair_n_wc": float(counts["WC"]),
+    }
+    if n == 0:
+        return metrics
+    p_cw = counts["CW"] / n
+    p_cc = counts["CC"] / n
+    p_ww = counts["WW"] / n
+    p_wc = counts["WC"] / n
+    metrics.update({
+        "p_cw": p_cw,
+        "p_cc": p_cc,
+        "p_ww": p_ww,
+        "p_wc": p_wc,
+        "e_r_cf": p_cw - p_wc,
+    })
+    self_ok = counts["CW"] + counts["CC"]
+    if self_ok > 0:
+        metrics["critique_exclusive_rate"] = counts["CW"] / self_ok
+    return metrics
 
 
 class PAGRewardManager:
     """Multi-turn dialogue reward manager with GenRM verification.
-    
+
     Flow: User question -> Model answer -> Verification -> Regeneration (if needed)
+
+    split_verify_reward=True:
+      R_disc = genrm_score at last verdict token (GAE γ=1 also credits feedback)
+      R_use  = usefulness at last feedback token:
+        generic_counterfactual: R_critique = R_y(y_self) - R_y(y_generic)
+        else if policy_rs: rs_coef * (acc_t2 - acc_t1)
+      rectifier last token is unchanged: acc + optional policy_rs shaping
     """
 
     def __init__(self, tokenizer, num_examine, config=None):
@@ -36,6 +101,69 @@ class PAGRewardManager:
         self.policy_rs = config.get('policy_rs', False)
         self.rs_coef = config.get('rs_coef', 10.0)
         self.end_with_verifer = config.get('end_with_verifer', False)
+        # Split R_disc (verdict last token) vs R_use (feedback last token).
+        self.split_verify_reward = bool(config.get('split_verify_reward', False))
+        self.generic_counterfactual = bool(config.get('generic_counterfactual', False))
+        if self.generic_counterfactual and not self.split_verify_reward:
+            print(
+                "Warning: generic_counterfactual=True requires split_verify_reward=True "
+                "to place R_critique on the self-feedback span; R_critique will not be used."
+            )
+
+    def _feedback_last_global(
+        self,
+        response_ids: torch.Tensor,
+        multiturn_mask: torch.Tensor,
+        verify_start: int,
+        verify_end: int,
+    ) -> Optional[int]:
+        """Global index of last feedback token inside the verify assistant span."""
+        if verify_end <= verify_start:
+            return None
+        seg_mask = multiturn_mask[verify_start:verify_end]
+        if seg_mask.numel() == 0 or not bool(seg_mask.any()):
+            return None
+        local_ids = response_ids[verify_start:verify_end][seg_mask]
+        local_i = find_feedback_last_token_index(self.tokenizer, local_ids)
+        if local_i is None:
+            return None
+        rel = torch.where(seg_mask)[0]
+        if local_i < 0 or local_i >= rel.numel():
+            return None
+        return int(verify_start + rel[local_i].item())
+
+    def _place_verify_rewards(
+        self,
+        reward_tensor: torch.Tensor,
+        row: int,
+        response_ids: torch.Tensor,
+        multiturn_mask: torch.Tensor,
+        verify_start: int,
+        verify_end: int,
+        r_disc: float,
+        r_use: float,
+    ) -> Tuple[int, Optional[int]]:
+        """Place discrimination vs feedback-usefulness rewards.
+
+        GAE with γ=1:
+          R_disc at last verdict token → credits feedback + verdict
+          R_use  at last feedback token → credits feedback only (does not flow forward)
+        """
+        last = verify_end - 1
+        if last < 0:
+            return last, None
+        r_disc = float(r_disc)
+        r_use = float(r_use)
+        if (not self.split_verify_reward) or r_use == 0.0:
+            reward_tensor[row, last] = r_disc + r_use
+            return last, None
+        fb = self._feedback_last_global(response_ids, multiturn_mask, verify_start, verify_end)
+        if fb is None or fb == last:
+            reward_tensor[row, last] = r_disc + r_use
+            return last, None
+        reward_tensor[row, last] = r_disc
+        reward_tensor[row, fb] = r_use
+        return last, fb
 
     def __call__(self, data: DataProto, return_dict: bool = False) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Compute rewards for multi-turn dialogue."""
@@ -88,6 +216,8 @@ class PAGRewardManager:
             genrm_pred = None
             genrm_score = None
             genrm_probs = None
+            acc_generic = None
+            r_critique = 0.0
                 
             # Process first turn
             first_response = self.tokenizer.decode(response_ids[:turn_boundaries[0]])
@@ -119,8 +249,9 @@ class PAGRewardManager:
                 )
                 
                 verify_result = get_verification_score(verify_response, gt_judge)
-                reward_tensor[i, verify_end - 1] = verify_result["genrm_score"]
                 metrics_tensors['verify_accuracies'][i, turn-1] = verify_result["genrm_score"]
+                r_disc = float(verify_result["genrm_score"])
+                r_use = 0.0
                 
                 # Store verification info
                 if turn == 1:
@@ -137,6 +268,13 @@ class PAGRewardManager:
                 
                 # Policy response (if exists)
                 if 2*turn >= len(turn_boundaries) or (self.end_with_verifer and turn == max_turns - 1):
+                    self._place_verify_rewards(
+                        reward_tensor, i, response_ids, multiturn_mask,
+                        verify_start, verify_end, r_disc, 0.0,
+                    )
+                    if turn == 1:
+                        reward_extra_info["r_disc"].append(r_disc)
+                        reward_extra_info["r_use"].append(0.0)
                     break
                 
                 if self.is_only_genrm:
@@ -150,10 +288,35 @@ class PAGRewardManager:
                 
                 policy_result = get_policy_score(solution_str=policy_response, ground_truth=ground_truth)
                 
-                # Set reward with optional reward shaping
+                # Set reward with optional reward shaping (rectifier unchanged)
                 reward_value = policy_result["acc"]
+                delta = float(policy_result["acc"]) - float(prev_acc)
                 if self.policy_rs:
-                    reward_value += self.rs_coef * (policy_result["acc"] - prev_acc)
+                    reward_value += self.rs_coef * delta
+                if self.generic_counterfactual:
+                    generic_text = data_item.non_tensor_batch.get("generic_response", "") or ""
+                    if isinstance(generic_text, bytes):
+                        generic_text = generic_text.decode("utf-8", errors="ignore")
+                    generic_text = str(generic_text).strip()
+                    if generic_text:
+                        generic_result = get_policy_score(
+                            solution_str=generic_text, ground_truth=ground_truth
+                        )
+                        acc_generic = float(generic_result["acc"])
+                        r_critique = critique_advantage(
+                            float(policy_result["acc"]), acc_generic
+                        )
+                    if self.split_verify_reward:
+                        r_use = r_critique
+                elif self.policy_rs and self.split_verify_reward:
+                    r_use = self.rs_coef * delta
+                self._place_verify_rewards(
+                    reward_tensor, i, response_ids, multiturn_mask,
+                    verify_start, verify_end, r_disc, r_use,
+                )
+                if turn == 1:
+                    reward_extra_info["r_disc"].append(r_disc)
+                    reward_extra_info["r_use"].append(float(r_use))
                 reward_tensor[i, policy_end - 1] = reward_value
                 
                 metrics_tensors['turn_accuracies'][i, turn] = policy_result["acc"]
@@ -182,11 +345,22 @@ class PAGRewardManager:
             reward_extra_info["revised"].append(bool(revised))
             reward_extra_info["final_turn"].append(int(final_turn))
             reward_extra_info["acc_final"].append(float(acc_final))
+            reward_extra_info["acc_generic"].append(
+                float(acc_generic) if acc_generic is not None else -1.0
+            )
+            reward_extra_info["r_critique"].append(float(r_critique))
+            if acc_generic is not None and acc_t2 is not None:
+                reward_extra_info["pair_cell"].append(pair_cell_label(acc_t2, acc_generic))
+            else:
+                reward_extra_info["pair_cell"].append("")
             # Keep genrm_* lists aligned even if verify segment missing
             if genrm_pred is None:
                 reward_extra_info["genrm_pred"].append("none")
                 reward_extra_info["genrm_score"].append(0.0)
                 reward_extra_info["genrm_probs"].append(None)
+            if len(reward_extra_info["r_disc"]) < len(reward_extra_info["acc"]):
+                reward_extra_info["r_disc"].append(float(genrm_score) if genrm_score is not None else 0.0)
+                reward_extra_info["r_use"].append(0.0)
 
             # Debug output
             if self.num_examine > 0 and printed_sources.get(data_source, 0) < self.num_examine:
@@ -202,6 +376,26 @@ class PAGRewardManager:
             data_sources = [data[i].non_tensor_batch.get('data_source', 'unknown') for i in range(len(data))]
         
         metrics = self._compute_metrics(metrics_tensors, data_sources, answer_logs, data.non_tensor_batch["final_generation_turn"])
+        if self.generic_counterfactual and reward_extra_info.get("acc_generic"):
+            acc_g = np.asarray(reward_extra_info["acc_generic"], dtype=np.float64)
+            n_all = max(int(acc_g.size), 1)
+            forked = acc_g >= 0.0
+            metrics["generic_fork_rate"] = float(forked.mean()) if acc_g.size else 0.0
+            cells = [c for c in reward_extra_info.get("pair_cell", []) if c in ("CW", "CC", "WW", "WC")]
+            metrics.update(paired_outcome_metrics(cells))
+            if forked.any():
+                metrics["generic_acc"] = float(acc_g[forked].mean())
+                metrics["r_critique"] = float(metrics.get("e_r_cf", 0.0))
+            if not data.meta_info.get("validate", False):
+                cer = metrics.get("critique_exclusive_rate", float("nan"))
+                print(
+                    "pair CW/CC/WW/WC = "
+                    f"{metrics.get('p_cw', 0):.3f}/{metrics.get('p_cc', 0):.3f}/"
+                    f"{metrics.get('p_ww', 0):.3f}/{metrics.get('p_wc', 0):.3f}  "
+                    f"E[R_cf]={metrics.get('e_r_cf', 0):.3f}  "
+                    f"CER={cer:.3f}  "
+                    f"n_fork={int(metrics.get('pair_n', 0))}/{n_all}"
+                )
         
         if return_dict:
             return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info, "metrics": metrics}

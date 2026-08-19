@@ -18,6 +18,8 @@ num_turns=2
 policy_rs=True
 rs_coef=1.0
 norm_type=role
+split_verify_reward=True
+generic_counterfactual=True
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=gae \
@@ -58,6 +60,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.num_turns=2 \
     reward_model.policy_rs=$policy_rs \
     reward_model.rs_coef=$rs_coef \
+    reward_model.split_verify_reward=$split_verify_reward \
+    actor_rollout_ref.rollout.generic_counterfactual=$generic_counterfactual \
+    actor_rollout_ref.rollout.include_generic_in_actor=False \
     critic.optim.lr=2e-6 \
     critic.use_dynamic_bsz=True \
     critic.model.use_remove_padding=True \

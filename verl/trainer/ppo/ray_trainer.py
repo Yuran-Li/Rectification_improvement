@@ -723,6 +723,17 @@ class RayPPOTrainer(object):
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
 
+        # Full validation window (all val batches). Per-batch val/multiturn/* would
+        # otherwise keep only the last dataloader shard.
+        pair_cells = [
+            c for c in reward_extra_infos_dict.get("pair_cell", [])
+            if c in ("CW", "CC", "WW", "WC")
+        ]
+        if pair_cells:
+            from verl.workers.reward_manager.pag import paired_outcome_metrics
+            for key, val in paired_outcome_metrics(pair_cells).items():
+                metric_dict[f"val/multiturn/{key}"] = val
+
         return metric_dict
 
     def init_workers(self):

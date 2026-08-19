@@ -23,19 +23,36 @@ export PYTHONNOUSERSITE=1
 
 math500="$REPO_ROOT/datasets/math500.parquet"
 math7500="$REPO_ROOT/datasets/math7500.parquet"
+dapo17k="$REPO_ROOT/datasets/dapo17k.parquet"
 
 PROJECT_NAME='PAG'
 CKPT_PATH="${CKPT_PATH:-$REPO_ROOT/checkpoints}"
 # Hub id or local snapshot path. Override MODEL_PATH for a local cache.
-MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}"
+MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}"
 
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen1p5b_pag}"
+# 1.5B → MATH 7.5k; 7B → DAPO 17k. Override with TRAIN_DATASET=/path/to.parquet
+_model_lc="$(printf '%s' "$MODEL_PATH" | tr '[:upper:]' '[:lower:]')"
+if [[ -n "${TRAIN_DATASET:-}" ]]; then
+  training_dataset="$TRAIN_DATASET"
+elif [[ "$_model_lc" =~ (^|[^0-9])7b([^0-9]|$) ]]; then
+  training_dataset="$dapo17k"
+elif [[ "$_model_lc" =~ (^|[^0-9])1\.5b([^0-9]|$) ]]; then
+  training_dataset="$math7500"
+else
+  echo "Cannot infer train set from MODEL_PATH=$MODEL_PATH (expected 1.5B or 7B). Set TRAIN_DATASET." >&2
+  exit 1
+fi
+echo "[run_pag_local] MODEL_PATH=$MODEL_PATH  training_dataset=$training_dataset"
+
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen7b_pag}"
 n=4
 rollout_type=pag
 num_turns=2
 policy_rs=True
 rs_coef=1.0
 norm_type=role
+split_verify_reward=True
+generic_counterfactual=True
 
 # Default: console only (set USE_WANDB=1 to enable wandb)
 if [[ "${USE_WANDB:-0}" == "1" ]]; then
@@ -50,7 +67,7 @@ NNODES="${NNODES:-1}"
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=gae \
-    data.train_files=[$math7500] \
+    data.train_files=[$training_dataset] \
     data.val_files="['$math500']" \
     data.filter_overlong_prompts=True \
     data.train_batch_size=512 \
@@ -87,6 +104,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.num_turns=2 \
     reward_model.policy_rs=$policy_rs \
     reward_model.rs_coef=$rs_coef \
+    reward_model.split_verify_reward=$split_verify_reward \
+    actor_rollout_ref.rollout.generic_counterfactual=$generic_counterfactual \
+    actor_rollout_ref.rollout.include_generic_in_actor=False \
     critic.optim.lr=2e-6 \
     critic.use_dynamic_bsz=True \
     critic.model.use_remove_padding=True \

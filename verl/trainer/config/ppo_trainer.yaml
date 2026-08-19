@@ -109,6 +109,10 @@ actor_rollout_ref:
     is_golden_generation: False
     is_only_genrm: False
     end_with_verifer: False
+    # If True, when a row rectifies, also sample y_generic from the same y0
+    # with a fixed generic critique. Default: attach on the self row only.
+    generic_counterfactual: False
+    include_generic_in_actor: False
     val_kwargs:
       # sampling parameters for validation
       top_k: -1 # 0 for hf rollout, -1 for vllm rollout
@@ -184,6 +188,9 @@ reward_model:
   end_with_verifer: ${actor_rollout_ref.rollout.end_with_verifer}
   policy_rs: False
   rs_coef: 10.0
+  # True: R_disc at last verdict token, R_use at last feedback token (GAE γ=1)
+  split_verify_reward: False
+  generic_counterfactual: ${actor_rollout_ref.rollout.generic_counterfactual}
   compute_score: null
 
 custom_reward_function:
