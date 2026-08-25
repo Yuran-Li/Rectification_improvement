@@ -52,7 +52,9 @@ policy_rs=True
 rs_coef=1.0
 norm_type=role
 split_verify_reward=True
-generic_counterfactual=True
+generic_counterfactual="${GENERIC_COUNTERFACTUAL:-True}"
+# 0 = keep R_self - R_generic. Set LAMBDA_REGEN=1.0 for Δ_self * [1+λ(1-p_regen)].
+lambda_regen="${LAMBDA_REGEN:-0.0}"
 
 # Default: console only (set USE_WANDB=1 to enable wandb)
 if [[ "${USE_WANDB:-0}" == "1" ]]; then
@@ -91,7 +93,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEM_UTIL:-0.6} \
+    actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEM_UTIL:-0.5} \
     actor_rollout_ref.rollout.n=$n \
     actor_rollout_ref.rollout.top_k=10000 \
     actor_rollout_ref.rollout.num_turns=$num_turns \
@@ -105,6 +107,7 @@ python3 -m verl.trainer.main_ppo \
     reward_model.policy_rs=$policy_rs \
     reward_model.rs_coef=$rs_coef \
     reward_model.split_verify_reward=$split_verify_reward \
+    reward_model.lambda_regen=$lambda_regen \
     actor_rollout_ref.rollout.generic_counterfactual=$generic_counterfactual \
     actor_rollout_ref.rollout.include_generic_in_actor=False \
     critic.optim.lr=2e-6 \
@@ -126,4 +129,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.default_local_dir=$CKPT_PATH/$PROJECT_NAME/$EXPERIMENT_NAME \
     trainer.val_before_train=True \
     trainer.resume_mode=auto \
-    trainer.log_val_generations=2
+    trainer.log_val_generations=2 \
+    "$@"

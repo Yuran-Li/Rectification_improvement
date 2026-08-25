@@ -191,6 +191,8 @@ reward_model:
   # True: R_disc at last verdict token, R_use at last feedback token (GAE γ=1)
   split_verify_reward: False
   generic_counterfactual: ${actor_rollout_ref.rollout.generic_counterfactual}
+  # >0: R_feedback = Δ_self * [1 + λ (1 - p_regen)]; 0 keeps R_self - R_generic
+  lambda_regen: 0.0
   compute_score: null
 
 custom_reward_function:

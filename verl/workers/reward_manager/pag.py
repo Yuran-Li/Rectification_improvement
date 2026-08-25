@@ -29,6 +29,140 @@ def critique_advantage(acc_self: float, acc_generic: float) -> float:
     return float(acc_self) - float(acc_generic)
 
 
+def regen_aware_feedback_reward(delta_self: float, p_regen: float, lambda_regen: float) -> float:
+    """R_feedback = Δ_self * [1 + lambda_regen * (1 - p_regen)].
+
+    Δ_self = acc_t2 - acc_t1 ∈ {-1, 0, +1}. Never subtracts generic/regen.
+    """
+    return float(delta_self) * (1.0 + float(lambda_regen) * (1.0 - float(p_regen)))
+
+
+def prompt_group_ids(data: DataProto) -> List[str]:
+    """Original-prompt ids for grouping K independent y0 rollouts.
+
+    Training assigns `uid` once per prompt, then `repeat(n, interleave=True)`,
+    so K siblings share `uid`. Do not use traj_id / verify / rectify forks.
+    Fallback: dataset `index`, then a hash of `raw_prompt_ids` / prompt tokens.
+    """
+    ntb = data.non_tensor_batch
+    n = len(data)
+    if "uid" in ntb:
+        return [str(x) for x in ntb["uid"]]
+    if "index" in ntb:
+        ids = [str(x) for x in ntb["index"]]
+        if n <= 1 or len(set(ids)) > 1:
+            return ids
+    if "raw_prompt_ids" in ntb:
+        out = []
+        for i in range(n):
+            ids = ntb["raw_prompt_ids"][i]
+            if isinstance(ids, np.ndarray):
+                ids = ids.tolist()
+            out.append("rp:" + ",".join(map(str, ids)))
+        return out
+    prompts = data.batch["prompts"]
+    return ["p:" + ",".join(map(str, prompts[i].tolist())) for i in range(n)]
+
+
+def compute_loo_p_regen(y0_correct: np.ndarray, group_ids: List[str]) -> np.ndarray:
+    """Leave-one-out turn-1 pass rate of the current policy on the same prompt.
+
+    y0_correct: (B,) in {0, 1} — correctness of each trajectory's own y0.
+    group_ids:  (B,) original-prompt id (typically `uid`).
+    returns:    (B,) p_regen_i = sum_{j != i} c_j / (K - 1).
+
+    K == 1 fallback: p_regen_i = c_i (single-sample MLE; LOO is undefined).
+    """
+    y0_correct = np.asarray(y0_correct, dtype=np.float64).reshape(-1)
+    n = int(y0_correct.size)
+    assert len(group_ids) == n, f"group_ids len {len(group_ids)} != y0_correct {n}"
+    groups: Dict[str, List[int]] = defaultdict(list)
+    for i, gid in enumerate(group_ids):
+        groups[str(gid)].append(i)
+    p_regen = np.zeros(n, dtype=np.float64)
+    for idxs in groups.values():
+        k = len(idxs)
+        c = y0_correct[idxs]
+        if k == 1:
+            p_regen[idxs[0]] = float(c[0])
+            continue
+        total = float(c.sum())
+        for i in idxs:
+            p_i = (total - float(y0_correct[i])) / float(k - 1)
+            assert 0.0 - 1e-9 <= p_i <= 1.0 + 1e-9, f"p_regen out of range: {p_i}"
+            p_regen[i] = min(1.0, max(0.0, p_i))
+    return p_regen
+
+
+# LOO p_regen bins (K=4 → {0, 1/3, 2/3, 1}): low = p < 0.5, high = p >= 0.5.
+P_REGEN_LOW_THRESH = 0.5
+
+
+def regen_feedback_metrics(
+    p_regen: np.ndarray,
+    regen_weight: np.ndarray,
+    r_self: np.ndarray,
+    r_feedback: np.ndarray,
+    group_ids: List[str],
+    revised=None,
+    acc_t2=None,
+) -> Dict[str, float]:
+    """Lightweight train logs for the regeneration-aware feedback reward."""
+    p_regen = np.asarray(p_regen, dtype=np.float64)
+    regen_weight = np.asarray(regen_weight, dtype=np.float64)
+    r_self = np.asarray(r_self, dtype=np.float64)
+    r_feedback = np.asarray(r_feedback, dtype=np.float64)
+    hard = p_regen <= 1e-12
+    low = p_regen < P_REGEN_LOW_THRESH
+    high = p_regen >= P_REGEN_LOW_THRESH
+    metrics = {
+        "mean_p_regen": float(p_regen.mean()) if p_regen.size else 0.0,
+        "frac_p_regen_0": float(hard.mean()) if p_regen.size else 0.0,
+        "mean_regen_weight": float(regen_weight.mean()) if regen_weight.size else 0.0,
+        "mean_R_self": float(r_self.mean()) if r_self.size else 0.0,
+        "mean_R_feedback": float(r_feedback.mean()) if r_feedback.size else 0.0,
+        "frac_rows_p_regen_zero": float(hard.mean()) if p_regen.size else 0.0,
+    }
+    if hard.any():
+        metrics["mean_R_feedback_p_regen_zero"] = float(r_feedback[hard].mean())
+    # unique prompts whose group y0 pass-rate is 0 (all siblings wrong → LOO p=0)
+    by_g: Dict[str, List[int]] = defaultdict(list)
+    for i, gid in enumerate(group_ids):
+        by_g[str(gid)].append(i)
+    n_g = max(len(by_g), 1)
+    n_hard_g = sum(1 for idxs in by_g.values() if float(np.mean(p_regen[idxs])) <= 1e-12)
+    metrics["frac_prompts_p_regen_zero"] = float(n_hard_g) / float(n_g)
+    self_ok = r_self >= 0.5
+    if self_ok.any():
+        metrics["frac_success_rectify_p_regen_zero"] = float(hard[self_ok].mean())
+
+    if revised is None:
+        revised_mask = np.ones(p_regen.shape[0], dtype=bool) if acc_t2 is not None else self_ok
+    else:
+        revised_mask = np.asarray(revised, dtype=bool)
+    if acc_t2 is None:
+        rect_correct = r_self >= 0.5
+    else:
+        rect_correct = np.asarray(acc_t2, dtype=np.float64) >= 0.5
+
+    def _rect_acc(bin_mask: np.ndarray):
+        m = bin_mask & revised_mask
+        if not m.any():
+            return None
+        return float(rect_correct[m].mean())
+
+    acc0 = _rect_acc(hard)
+    acc_low = _rect_acc(low)
+    acc_high = _rect_acc(high)
+    if acc0 is not None:
+        metrics["rect_acc_p_regen_0"] = acc0
+    if acc_low is not None:
+        metrics["rect_acc_p_regen_low"] = acc_low
+    if acc_high is not None:
+        metrics["rect_acc_p_regen_high"] = acc_high
+    return metrics
+
+
 def pair_cell_label(acc_self: float, acc_generic: float) -> str:
     """Four-way (self, generic) cell: CW, CC, WW, WC. C := acc >= 0.5."""
     self_c = float(acc_self) >= 0.5
@@ -87,7 +221,10 @@ class PAGRewardManager:
     split_verify_reward=True:
       R_disc = genrm_score at last verdict token (GAE γ=1 also credits feedback)
       R_use  = usefulness at last feedback token:
-        generic_counterfactual: R_critique = R_y(y_self) - R_y(y_generic)
+        lambda_regen > 0: R_feedback = Δ_self * [1 + λ (1 - p_regen)]
+          Δ_self = acc_t2 - acc_t1; p_regen = LOO turn-1 pass rate on the same uid.
+          Generic is not used in this reward. Rectifier is unchanged.
+        else generic_counterfactual: R_critique = R_y(y_self) - R_y(y_generic)
         else if policy_rs: rs_coef * (acc_t2 - acc_t1)
       rectifier last token is unchanged: acc + optional policy_rs shaping
     """
@@ -104,10 +241,16 @@ class PAGRewardManager:
         # Split R_disc (verdict last token) vs R_use (feedback last token).
         self.split_verify_reward = bool(config.get('split_verify_reward', False))
         self.generic_counterfactual = bool(config.get('generic_counterfactual', False))
+        self.lambda_regen = float(config.get('lambda_regen', 0.0))
         if self.generic_counterfactual and not self.split_verify_reward:
             print(
                 "Warning: generic_counterfactual=True requires split_verify_reward=True "
                 "to place R_critique on the self-feedback span; R_critique will not be used."
+            )
+        if self.lambda_regen > 0.0 and not self.split_verify_reward:
+            print(
+                "Warning: lambda_regen>0 is intended for the verifier-feedback token "
+                "(split_verify_reward=True); otherwise R_feedback is added on the verdict token."
             )
 
     def _feedback_last_global(
@@ -185,6 +328,32 @@ class PAGRewardManager:
         answer_logs = []
         reward_extra_info = defaultdict(list)
         printed_sources = {}
+
+        group_ids = prompt_group_ids(data)
+        y0_correct = np.zeros(batch_size, dtype=np.float64)
+        y0_cache: List[Optional[Dict[str, Any]]] = [None] * batch_size
+        y0_boundaries: List[List[int]] = [[] for _ in range(batch_size)]
+        for i in range(batch_size):
+            item = data[i]
+            mask = item.batch['multiturn_mask']
+            tbs: List[int] = []
+            if mask.numel() > 0:
+                padded = torch.cat([torch.tensor([True], device=mask.device), mask])
+                diff = padded[1:].long() - padded[:-1].long()
+                tbs = torch.where(diff == -1)[0].tolist()
+                if mask[-1]:
+                    tbs.append(mask.size(0))
+            y0_boundaries[i] = tbs
+            if not tbs:
+                continue
+            y0_text = self.tokenizer.decode(item.batch['responses'][:tbs[0]])
+            y0_res = get_policy_score(
+                solution_str=y0_text,
+                ground_truth=item.non_tensor_batch['reward_model']['ground_truth'],
+            )
+            y0_cache[i] = y0_res
+            y0_correct[i] = 1.0 if float(y0_res["acc"]) >= 0.5 else 0.0
+        p_regen = compute_loo_p_regen(y0_correct, group_ids)
         
         for i in range(batch_size):
             # Initialize extra info for verifier mode
@@ -198,9 +367,9 @@ class PAGRewardManager:
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
             data_source = data_item.non_tensor_batch.get('data_source', 'unknown')
             
-            # Find turn boundaries from mask
-            turn_boundaries = []
-            if multiturn_mask.numel() > 0:
+            # Find turn boundaries from mask (cached from the y0 pre-pass)
+            turn_boundaries = y0_boundaries[i]
+            if not turn_boundaries and multiturn_mask.numel() > 0:
                 padded_mask = torch.cat([torch.tensor([True], device=multiturn_mask.device), multiturn_mask])
                 diff = padded_mask[1:].long() - padded_mask[:-1].long()
                 turn_boundaries = torch.where(diff == -1)[0].tolist()
@@ -218,10 +387,18 @@ class PAGRewardManager:
             genrm_probs = None
             acc_generic = None
             r_critique = 0.0
+            r_self = 0.0
+            r_feedback = 0.0
+            delta_self = 0.0
+            regen_weight = 1.0 + self.lambda_regen * (1.0 - float(p_regen[i]))
+            verify_text = ""
+            generic_text_export = ""
                 
-            # Process first turn
-            first_response = self.tokenizer.decode(response_ids[:turn_boundaries[0]])
-            first_result = get_policy_score(solution_str=first_response, ground_truth=ground_truth)
+            # Process first turn (reuse cached math-verify)
+            first_result = y0_cache[i]
+            if first_result is None:
+                first_response = self.tokenizer.decode(response_ids[:turn_boundaries[0]])
+                first_result = get_policy_score(solution_str=first_response, ground_truth=ground_truth)
             
             reward_extra_info["pred"].append(first_result["pred"])
             reward_extra_info["acc"].append(first_result["acc"])
@@ -255,6 +432,7 @@ class PAGRewardManager:
                 
                 # Store verification info
                 if turn == 1:
+                    verify_text = verify_response
                     genrm_pred = verify_result["genrm_pred"]
                     genrm_score = verify_result["genrm_score"]
                     genrm_probs = data_item.non_tensor_batch.get("verify_probs", None)
@@ -291,18 +469,30 @@ class PAGRewardManager:
                 # Set reward with optional reward shaping (rectifier unchanged)
                 reward_value = policy_result["acc"]
                 delta = float(policy_result["acc"]) - float(prev_acc)
+                delta_self = delta
                 if self.policy_rs:
                     reward_value += self.rs_coef * delta
+                # Optional generic scoring (logging / ablation only when lambda_regen>0)
                 if self.generic_counterfactual:
                     generic_text = data_item.non_tensor_batch.get("generic_response", "") or ""
                     if isinstance(generic_text, bytes):
                         generic_text = generic_text.decode("utf-8", errors="ignore")
                     generic_text = str(generic_text).strip()
+                    generic_text_export = generic_text
                     if generic_text:
                         generic_result = get_policy_score(
                             solution_str=generic_text, ground_truth=ground_truth
                         )
                         acc_generic = float(generic_result["acc"])
+                if self.lambda_regen > 0.0:
+                    r_self = 1.0 if float(policy_result["acc"]) >= 0.5 else 0.0
+                    r_feedback = regen_aware_feedback_reward(
+                        delta, float(p_regen[i]), self.lambda_regen
+                    )
+                    r_critique = r_feedback
+                    r_use = r_feedback
+                elif self.generic_counterfactual:
+                    if acc_generic is not None:
                         r_critique = critique_advantage(
                             float(policy_result["acc"]), acc_generic
                         )
@@ -349,6 +539,13 @@ class PAGRewardManager:
                 float(acc_generic) if acc_generic is not None else -1.0
             )
             reward_extra_info["r_critique"].append(float(r_critique))
+            reward_extra_info["p_regen"].append(float(p_regen[i]))
+            reward_extra_info["regen_weight"].append(float(regen_weight))
+            reward_extra_info["r_self"].append(float(r_self))
+            reward_extra_info["delta_self"].append(float(delta_self))
+            reward_extra_info["r_feedback"].append(float(r_feedback))
+            reward_extra_info["verify_text"].append(verify_text)
+            reward_extra_info["generic_response"].append(generic_text_export)
             if acc_generic is not None and acc_t2 is not None:
                 reward_extra_info["pair_cell"].append(pair_cell_label(acc_t2, acc_generic))
             else:
@@ -376,6 +573,23 @@ class PAGRewardManager:
             data_sources = [data[i].non_tensor_batch.get('data_source', 'unknown') for i in range(len(data))]
         
         metrics = self._compute_metrics(metrics_tensors, data_sources, answer_logs, data.non_tensor_batch["final_generation_turn"])
+        metrics.update(regen_feedback_metrics(
+            p_regen=p_regen,
+            regen_weight=np.asarray(reward_extra_info["regen_weight"], dtype=np.float64),
+            r_self=np.asarray(reward_extra_info["r_self"], dtype=np.float64),
+            r_feedback=np.asarray(reward_extra_info["r_feedback"], dtype=np.float64),
+            group_ids=group_ids,
+            revised=reward_extra_info["revised"],
+            acc_t2=reward_extra_info["acc_t2"],
+        ))
+        metrics["lambda_regen"] = float(self.lambda_regen)
+        if reward_extra_info.get("delta_self"):
+            ds = np.asarray(reward_extra_info["delta_self"], dtype=np.float64)
+            rev = np.asarray(reward_extra_info.get("revised", []), dtype=bool)
+            if rev.size == ds.size and rev.any():
+                metrics["mean_delta_self"] = float(ds[rev].mean())
+            elif ds.size:
+                metrics["mean_delta_self"] = float(ds.mean())
         if self.generic_counterfactual and reward_extra_info.get("acc_generic"):
             acc_g = np.asarray(reward_extra_info["acc_generic"], dtype=np.float64)
             n_all = max(int(acc_g.size), 1)

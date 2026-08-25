@@ -19,7 +19,21 @@ import json
 import os
 from datetime import datetime
 from collections import defaultdict
-from typing import List, Dict, Any
+from typing import Any, Dict, List
+
+import numpy as np
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return value
 
 
 def save_validation_results_to_json(data_sources: List[str],
@@ -53,27 +67,30 @@ def save_validation_results_to_json(data_sources: List[str],
         
         for var_name, var_vals in infos_dict.items():
             if sample_idx < len(var_vals):
+                val = _jsonable(var_vals[sample_idx])
                 # 存储所有感兴趣的字段到JSON
                 if var_name == "reward":
-                    sample_data["score"] = var_vals[sample_idx]
+                    sample_data["score"] = val
                 elif var_name == "pred":
-                    sample_data["prediction"] = var_vals[sample_idx]
+                    sample_data["prediction"] = val
                 elif var_name == "genrm_pred":
-                    sample_data["genrm_prediction"] = var_vals[sample_idx]
+                    sample_data["genrm_prediction"] = val
                 elif var_name == "acc":
-                    sample_data["is_correct"] = bool(var_vals[sample_idx] >= 0.5)
+                    sample_data["is_correct"] = bool(val >= 0.5)
                 elif var_name == "ground_truth":
-                    sample_data["ground_truth"] = var_vals[sample_idx]
+                    sample_data["ground_truth"] = val
                 elif var_name == "response":
-                    sample_data["response"] = var_vals[sample_idx]
+                    sample_data["response"] = val
                 elif var_name == "genrm_score":
-                    sample_data["genrm_score"] = var_vals[sample_idx]
+                    sample_data["genrm_score"] = val
                 elif var_name in (
                     "acc_t1", "acc_t2", "acc_final", "pred_t1", "pred_t2",
                     "revised", "final_turn", "ground_truth", "genrm_probs",
-                    "data_source",
+                    "data_source", "acc_generic", "r_critique", "pair_cell",
+                    "verify_text", "generic_response",
+                    "p_regen", "regen_weight", "r_self", "delta_self", "r_feedback",
                 ):
-                    sample_data[var_name] = var_vals[sample_idx]
+                    sample_data[var_name] = val
         
         # 将样本数据添加到对应提示的列表中
         if sample_data:

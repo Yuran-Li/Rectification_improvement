@@ -6,11 +6,10 @@ hard closer. Do not emit a full corrected solution or \\boxed{} in verify.
 
 VERIFY_USER = (
     "Verify the previous solution without re-solving the problem from scratch. "
-    "Do NOT write a full corrected solution, and do NOT put a final answer in \\boxed{}. "
-    "Check only the given steps. "
+    "Check the given solution step-by-step: if you find a mistake, state the wrong step, "
     "If you find a mistake: in 1-4 sentences, name the wrong step, explain why it is wrong, "
-    "and say what should be fixed. End your response with exactly: The answer is wrong. "
-    "If all steps are correct: do not propose edits. End your response with exactly: The answer is correct."
+    "explain why it is wrong, and end your response with 'The answer is wrong'. "
+    "If all steps are correct: do not propose edits. End your response with: The answer is correct."
 )
 
 REGENERATE_USER = (

@@ -1,0 +1,148 @@
+{
+  "n_rows": 250,
+  "pct_actionable": 100.0,
+  "metrics": {
+    "freeform__full_regen": {
+      "W2C@1_pct": 18.0,
+      "PPR@1_pct": 30.0,
+      "FCR@1_pct": 18.0,
+      "n_actionable": 250,
+      "W2C_loc_ok_pct": 18.0,
+      "W2C_loc_missing_pct": null
+    },
+    "freeform__prefix_rewrite": {
+      "W2C@1_pct": 7.6,
+      "PPR@1_pct": 100.0,
+      "FCR@1_pct": 7.6,
+      "n_actionable": 250,
+      "W2C_loc_ok_pct": 7.6,
+      "W2C_loc_missing_pct": null
+    },
+    "localization__full_regen": {
+      "W2C@1_pct": 7.6,
+      "PPR@1_pct": 29.2,
+      "FCR@1_pct": 7.6,
+      "n_actionable": 250,
+      "W2C_loc_ok_pct": 7.6,
+      "W2C_loc_missing_pct": null
+    },
+    "localization__prefix_rewrite": {
+      "W2C@1_pct": 0.8,
+      "PPR@1_pct": 100.0,
+      "FCR@1_pct": 0.8,
+      "n_actionable": 250,
+      "W2C_loc_ok_pct": 0.8,
+      "W2C_loc_missing_pct": null
+    },
+    "localization_analysis__full_regen": {
+      "W2C@1_pct": 12.8,
+      "PPR@1_pct": 34.8,
+      "FCR@1_pct": 12.8,
+      "n_actionable": 250,
+      "W2C_loc_ok_pct": 12.8,
+      "W2C_loc_missing_pct": null
+    },
+    "localization_analysis__prefix_rewrite": {
+      "W2C@1_pct": 4.0,
+      "PPR@1_pct": 100.0,
+      "FCR@1_pct": 4.0,
+      "n_actionable": 250,
+      "W2C_loc_ok_pct": 4.0,
+      "W2C_loc_missing_pct": null
+    },
+    "localization_analysis_plan__full_regen": {
+      "W2C@1_pct": 16.8,
+      "PPR@1_pct": 33.2,
+      "FCR@1_pct": 16.8,
+      "n_actionable": 250,
+      "W2C_loc_ok_pct": 16.8,
+      "W2C_loc_missing_pct": null
+    },
+    "localization_analysis_plan__prefix_rewrite": {
+      "W2C@1_pct": 4.0,
+      "PPR@1_pct": 100.0,
+      "FCR@1_pct": 4.0,
+      "n_actionable": 250,
+      "W2C_loc_ok_pct": 4.0,
+      "W2C_loc_missing_pct": null
+    },
+    "regenerate__full_regen": {
+      "W2C@1_pct": 18.8,
+      "PPR@1_pct": 37.6,
+      "FCR@1_pct": 18.8,
+      "n_actionable": 250,
+      "W2C_loc_ok_pct": 18.8,
+      "W2C_loc_missing_pct": null
+    },
+    "regenerate__prefix_rewrite": {
+      "W2C@1_pct": 1.6,
+      "PPR@1_pct": 100.0,
+      "FCR@1_pct": 1.6,
+      "n_actionable": 250,
+      "W2C_loc_ok_pct": 1.6,
+      "W2C_loc_missing_pct": null
+    },
+    "shuffled_plan__full_regen": {
+      "W2C@1_pct": 2.0,
+      "PPR@1_pct": 27.2,
+      "FCR@1_pct": 2.0,
+      "n_actionable": 250,
+      "W2C_loc_ok_pct": 2.0,
+      "W2C_loc_missing_pct": null
+    },
+    "shuffled_plan__prefix_rewrite": {
+      "W2C@1_pct": 0.4,
+      "PPR@1_pct": 100.0,
+      "FCR@1_pct": 0.4,
+      "n_actionable": 250,
+      "W2C_loc_ok_pct": 0.4,
+      "W2C_loc_missing_pct": null
+    },
+    "wrong_only__full_regen": {
+      "W2C@1_pct": 6.0,
+      "PPR@1_pct": 36.4,
+      "FCR@1_pct": 6.0,
+      "n_actionable": 250,
+      "W2C_loc_ok_pct": 6.0,
+      "W2C_loc_missing_pct": null
+    },
+    "wrong_only__prefix_rewrite": {
+      "W2C@1_pct": 1.6,
+      "PPR@1_pct": 100.0,
+      "FCR@1_pct": 1.6,
+      "n_actionable": 250,
+      "W2C_loc_ok_pct": 1.6,
+      "W2C_loc_missing_pct": null
+    }
+  },
+  "delta_critique_W2C": {
+    "full_regen": 14.8,
+    "prefix_rewrite": 3.6
+  },
+  "w2c_matrix": {
+    "regenerate": {
+      "full_regen": 18.8,
+      "prefix_rewrite": 1.6
+    },
+    "wrong_only": {
+      "full_regen": 6.0,
+      "prefix_rewrite": 1.6
+    },
+    "localization": {
+      "full_regen": 7.6,
+      "prefix_rewrite": 0.8
+    },
+    "localization_analysis": {
+      "full_regen": 12.8,
+      "prefix_rewrite": 4.0
+    },
+    "localization_analysis_plan": {
+      "full_regen": 16.8,
+      "prefix_rewrite": 4.0
+    },
+    "freeform": {
+      "full_regen": 18.0,
+      "prefix_rewrite": 7.6
+    }
+  }
+}

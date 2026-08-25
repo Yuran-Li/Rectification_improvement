@@ -28,6 +28,7 @@ import re
 from contextlib import nullcontext
 import torch
 import torch.distributed
+import torch.nn.functional as F
 from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, CPUOffload
 from tqdm import tqdm
@@ -268,6 +269,23 @@ class FSDPSFTTrainer(object):
 
         log_gpu_memory_usage('After FSDP wrapping', logger=logger)
 
+        self.lm_kl_coeff = float(self.config.optim.get('lm_kl_coeff', 0.0) or 0.0)
+        self.kl_loss_tokens_only = bool(self.config.optim.get('kl_loss_tokens_only', False))
+        self.fsdp_ref_model = None
+        if self.lm_kl_coeff > 0:
+            if self.use_remove_padding or self.config.ulysses_sequence_parallel_size > 1:
+                raise ValueError('optim.lm_kl_coeff>0 is only supported without sequence parallel / remove_padding')
+            self.fsdp_ref_model = self._build_ref_fsdp(local_model_path, config, trust_remote_code)
+            if self.device_mesh.get_rank() == 0:
+                print(
+                    f'SFT KL enabled: coeff={self.lm_kl_coeff}, '
+                    f'kl_loss_tokens_only={self.kl_loss_tokens_only} (ref=frozen {local_model_path})'
+                )
+
+        self._last_kl = 0.0
+        if self.fsdp_ref_model is not None:
+            self.fsdp_ref_model.eval()
+
         self.optimizer = optim.AdamW(self.fsdp_model.parameters(),
                                      lr=self.config.optim.lr,
                                      betas=self.config.optim.betas,
@@ -288,6 +306,50 @@ class FSDPSFTTrainer(object):
         self.lr_scheduler = get_cosine_schedule_with_warmup(optimizer=self.optimizer,
                                                             num_warmup_steps=num_warmup_steps,
                                                             num_training_steps=self.total_steps)
+
+    def _build_ref_fsdp(self, local_model_path, hf_config, trust_remote_code):
+        """Frozen copy of the SFT init, FSDP-sharded. Used for KL(π || π_ref)."""
+        log_gpu_memory_usage('Before ref model allocation', logger=logger)
+        ref = AutoModelForCausalLM.from_pretrained(local_model_path,
+                                                   config=hf_config,
+                                                   torch_dtype=torch.bfloat16,
+                                                   attn_implementation='flash_attention_2',
+                                                   trust_remote_code=trust_remote_code)
+        ref.eval()
+        for p in ref.parameters():
+            p.requires_grad = False
+
+        mixed_precision = MixedPrecision(param_dtype=torch.bfloat16,
+                                         reduce_dtype=torch.float32,
+                                         buffer_dtype=torch.float32)
+        auto_wrap_policy = get_fsdp_wrap_policy(ref,
+                                                config=self.config.model.fsdp_config.wrap_policy,
+                                                is_lora=False)
+        if not self.config.model.fsdp_config.cpu_offload:
+            cpu_offload = None
+        else:
+            cpu_offload = CPUOffload(offload_params=self.config.model.fsdp_config.offload_params)
+        fsdp_ref = FSDP(module=ref,
+                        auto_wrap_policy=auto_wrap_policy,
+                        param_init_fn=init_fn,
+                        sharding_strategy=ShardingStrategy.FULL_SHARD,
+                        mixed_precision=mixed_precision,
+                        device_mesh=self.device_mesh,
+                        sync_module_states=True,
+                        device_id=torch.cuda.current_device(),
+                        cpu_offload=cpu_offload,
+                        use_orig_params=False)
+        log_gpu_memory_usage('After ref FSDP wrapping', logger=logger)
+        return fsdp_ref
+
+    def _kl_from_logits(self, policy_logits, ref_logits, token_mask):
+        """Mean token-level KL(π || π_ref) over mask (shifted [B*T] bool/float)."""
+        log_p = F.log_softmax(policy_logits.float(), dim=-1)
+        log_q = F.log_softmax(ref_logits.float(), dim=-1)
+        kl = (log_p.exp() * (log_p - log_q)).sum(dim=-1)  # [B, T]
+        kl = kl.reshape(-1) * token_mask.to(kl.dtype)
+        denom = token_mask.sum() + 1e-8
+        return torch.sum(kl) / denom
 
     def _compute_loss_and_backward(self, batch, do_backward=True):
         """Compute loss with optional sequence parallelism and remove padding features"""
@@ -380,7 +442,22 @@ class FSDPSFTTrainer(object):
                 else:
                     dp_size = 1
 
-                loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
+                ce_loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
+                kl_loss = torch.zeros((), device=ce_loss.device, dtype=ce_loss.dtype)
+                if self.fsdp_ref_model is not None and not use_sp:
+                    with torch.no_grad():
+                        ref_out = self.fsdp_ref_model(input_ids=input_ids,
+                                                      attention_mask=attention_mask,
+                                                      position_ids=position_ids,
+                                                      use_cache=False)
+                    ref_shift = ref_out.logits[..., :-1, :].contiguous().view(-1, self.model.config.vocab_size)
+                    if self.kl_loss_tokens_only:
+                        kl_mask = loss_mask
+                    else:
+                        kl_mask = attention_mask[:, 1:].reshape(-1).to(loss_mask.dtype)
+                    kl_loss = self._kl_from_logits(shift_logits, ref_shift, kl_mask)
+                self._last_kl = float(kl_loss.detach().item())
+                loss = ce_loss + self.lm_kl_coeff * kl_loss
 
                 if do_backward:
                     loss.backward()
@@ -398,9 +475,11 @@ class FSDPSFTTrainer(object):
         micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
         n_micro_batches = len(micro_batches)
         step_loss = 0
+        step_kl = 0
         for micro_batch in micro_batches:
             loss = self._compute_loss_and_backward(batch=micro_batch) / n_micro_batches
             step_loss += loss.item()
+            step_kl += getattr(self, '_last_kl', 0.0) / n_micro_batches
 
         grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
 
@@ -423,8 +502,14 @@ class FSDPSFTTrainer(object):
         log_gpu_memory_usage('After offload weights', logger=logger)
 
         step_loss = torch.tensor(step_loss).cuda()
+        step_kl = torch.tensor(step_kl).cuda()
         torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
-        return {'train/loss': step_loss.detach().item(), 'train/lr(1e-3)': lr * 1e3}
+        torch.distributed.all_reduce(step_kl, op=torch.distributed.ReduceOp.AVG)
+        return {
+            'train/loss': step_loss.detach().item(),
+            'train/kl': step_kl.detach().item(),
+            'train/lr(1e-3)': lr * 1e3,
+        }
 
     def validation_step(self, batch: TensorDict):
         self.fsdp_model.eval()

@@ -19,7 +19,9 @@ policy_rs=True
 rs_coef=1.0
 norm_type=role
 split_verify_reward=True
-generic_counterfactual=True
+generic_counterfactual="${GENERIC_COUNTERFACTUAL:-True}"
+# 0 = keep R_self - R_generic. Set LAMBDA_REGEN=1.0 for Δ_self * [1+λ(1-p_regen)].
+lambda_regen="${LAMBDA_REGEN:-0.0}"
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=gae \
@@ -61,6 +63,7 @@ python3 -m verl.trainer.main_ppo \
     reward_model.policy_rs=$policy_rs \
     reward_model.rs_coef=$rs_coef \
     reward_model.split_verify_reward=$split_verify_reward \
+    reward_model.lambda_regen=$lambda_regen \
     actor_rollout_ref.rollout.generic_counterfactual=$generic_counterfactual \
     actor_rollout_ref.rollout.include_generic_in_actor=False \
     critic.optim.lr=2e-6 \

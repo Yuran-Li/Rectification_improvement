@@ -38,6 +38,10 @@ optim:
   weight_decay: 0.01
   warmup_steps_ratio: 0.1
   clip_grad: 1.0
+  # S2R-style KL(π || π_ref) to the frozen init (partial_pretrain). 0 disables.
+  lm_kl_coeff: 0.01
+  # false: KL on all non-pad tokens (protects A1 / y0). true: only CE tokens (last turn).
+  kl_loss_tokens_only: false
 ulysses_sequence_parallel_size: 1
 use_remove_padding: False
 trainer:
