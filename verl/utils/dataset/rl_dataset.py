@@ -225,6 +225,16 @@ class RLHFDataset(Dataset):
         index = row_dict.get("extra_info", {}).get("index", 0)
         row_dict["index"] = index
 
+        # add MATH difficulty level (int 1-5) for SEC sampler.
+        # "Level ?" entries (row 2773 & 2832) are both confirmed Level 3 from the
+        # original hendrycks-MATH-benchmark dataset and are mapped accordingly.
+        raw_level = row_dict.get("level", "Level ?")
+        if isinstance(raw_level, str) and raw_level.startswith("Level "):
+            lvl_str = raw_level.split()[-1]
+            row_dict["math_level"] = int(lvl_str) if lvl_str.isdigit() else 3
+        else:
+            row_dict["math_level"] = 3  # fallback
+
         return row_dict
 
     def __getstate__(self):

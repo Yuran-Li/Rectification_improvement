@@ -8,6 +8,7 @@
 </div>
 
 ## News
+- **[2026/08/27]** Self-Evolving Curriculum (SEC): online MATH-level bandit sampler, per-slot multinomial category sampling, generation-advantage Q-update, full WandB diagnostics
 - **[2026/08/18]** Critique-informativeness PPO: split verifier rewards, same-`y0` generic counterfactual, pair logging (`P(CW)`, CER)
 - **[2025/06/27]** 🎉 Code released
 - **[2025/06/13]** 🎉 [HomePage](https://jackory.github.io/pag/) released
@@ -134,6 +135,127 @@ FEEDBACK_MODE=generic N_GPUS=8 bash quick_start/run_pag_local.sh
 `FEEDBACK_MODE=generic` turns on the extra `y_generic` rollout. `regen` / `delta` skip it unless you set `GENERIC_COUNTERFACTUAL=True` (logging only). `lambda_regen` is the regen weight, not the mode switch.
 
 Unit tests: `PYTHONPATH=. python tests/test_split_verify_reward.py` (PAG env).
+
+---
+
+## Self-Evolving Curriculum (SEC)
+
+An optional online curriculum sampler that replaces uniform prompt sampling with a MATH-level bandit. SEC and the previous generation-frontier curriculum are **mutually exclusive**.
+
+### Design
+
+SEC maintains a Q-value per MATH difficulty level (1–5) and updates it after every PPO step using the generation-turn advantage as the reward signal:
+
+```
+Q_0(c) = 0  for all c
+P_t(c) = softmax(Q_t / τ)
+
+for each batch of size B:
+    for each slot b = 1..B (i.i.d., with replacement):
+        c_b ~ Categorical(P_t)
+        prompt_b ~ Uniform(level_{c_b})   # with replacement
+
+    → normal PAG rollout + advantage computation
+    → r_t(c) = mean u_i^G over prompts i from category c
+    → Q_{t+1}(c) = (1-α) Q_t(c) + α r_t(c)   (absent categories unchanged)
+    → P_{t+1}
+```
+
+`u_i^G` is the mean absolute generation-turn (`y0`) advantage over the K rollout trajectories of prompt `i`:
+
+```
+u_i^G = (1/K) Σ_k (1/T_ik^G) Σ_{t ∈ y0,ik} |A^G_{ik,t}|
+```
+
+Only `A^G` (generation advantage) feeds the Q update. Verification and rectification advantages are logged per level for diagnostics only (`sec/A_verify_level_*`, `sec/A_rectify_level_*`).
+
+### Dataset categories
+
+Training prompts (`math7500.parquet`) are assigned permanently to one of five MATH difficulty levels. Two samples with ambiguous labels (`Level ?`) are resolved to **Level 3** based on the original MATH dataset metadata. Category membership does not change during training.
+
+| Level | Prompts |
+|-------|---------|
+| 1 | 564 |
+| 2 | 1187 |
+| 3 | 1908 |
+| 4 | 2035 |
+| 5 | 2304 |
+
+### DataLoader bypass
+
+Because `Q_{t+1}` must determine batch `t+1`, SEC bypasses `StatefulDataLoader` entirely when enabled. The trainer calls `sec_sampler.sample_batch(B)` to get indices, then fetches and collates items from `train_dataset` on the main process before dispatching to workers. No prefetching with stale Q-values.
+
+### Configuration
+
+```yaml
+# ppo_trainer.yaml
+sec:
+  enabled: false
+  q_alpha: 0.1        # EMA learning rate α
+  temperature: 1.0    # softmax temperature τ
+  log_path: null      # optional JSONL log path
+```
+
+`sec.enabled` and `curriculum.enabled` cannot both be `true` (assertion in trainer + shell guard).
+
+### Launch
+
+```bash
+# SEC training (1.5B, 6 GPUs)
+SEC_ENABLED=true SEC_Q_ALPHA=0.1 SEC_TEMPERATURE=1.0 \
+  FEEDBACK_MODE=delta CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+  PROJECT_NAME="PAG-sec" EXPERIMENT_NAME="qwen1p5b_pag_sec" \
+  MODEL_PATH="Qwen/Qwen2.5-1.5B-Instruct" \
+  bash quick_start/qwen1p5b_pag.sh \
+    trainer.n_gpus_per_node=6 \
+    data.train_batch_size=510 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=126 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5
+
+# Uniform baseline (SEC off, old curriculum off)
+SEC_ENABLED=false CURRICULUM_ENABLED=false \
+  FEEDBACK_MODE=delta CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+  PROJECT_NAME="PAG-sec" EXPERIMENT_NAME="qwen1p5b_pag_base" \
+  MODEL_PATH="Qwen/Qwen2.5-1.5B-Instruct" \
+  bash quick_start/qwen1p5b_pag.sh \
+    trainer.n_gpus_per_node=6 \
+    data.train_batch_size=510 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=126 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5
+```
+
+### WandB metrics logged per step
+
+| Metric | Description |
+|--------|-------------|
+| `sec/Q_level_{1..5}` | Current Q-values |
+| `sec/P_level_{1..5}` | Sampling probabilities |
+| `sec/reward_level_{1..5}` | `r_t(c)` used for Q update |
+| `sec/batch_count_level_{1..5}` | Number of prompts per level in this batch |
+| `sec/cumulative_frac_level_{1..5}` | Cumulative fraction of total prompts seen per level |
+| `sec/mean_sampled_level` | Mean MATH level in this batch |
+| `sec/A_generate_level_{1..5}` | Mean absolute generation advantage per level |
+| `sec/A_verify_level_{1..5}` | Mean absolute verification advantage per level (diagnostic) |
+| `sec/A_rectify_level_{1..5}` | Mean absolute rectification advantage per level (diagnostic) |
+
+### Unit tests
+
+```bash
+PYTHONPATH=. python tests/test_sec_sampler.py
+```
+
+10 deterministic tests covering: policy initialisation, sampling probabilities, within-category uniformity, absent-category Q freeze, K-trajectory regrouping, `y0`-only masking, Q→batch causality, SEC/curriculum mutual exclusivity, and baseline preservation.
+
+### Key files
+
+| File | Role |
+|------|------|
+| `verl/utils/dataset/sec_sampler.py` | `SECSampler` class (sampling, Q update, checkpointing) |
+| `verl/utils/dataset/rl_dataset.py` | Adds `math_level` field; resolves `Level ?` → 3 |
+| `verl/trainer/ppo/ray_trainer.py` | SEC init, manual batch loop, Q update, logging |
+| `verl/trainer/config/ppo_trainer.yaml` | `sec:` config block |
+| `quick_start/qwen1p5b_pag.sh` | `SEC_ENABLED`, `SEC_Q_ALPHA`, `SEC_TEMPERATURE` env vars |
+| `tests/test_sec_sampler.py` | 10 unit tests |
 
 ## Citation
 If you find this project helpful, please cite:

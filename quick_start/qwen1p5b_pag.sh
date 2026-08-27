@@ -43,6 +43,18 @@ lambda_regen="${LAMBDA_REGEN:-1.0}"
 curriculum_enabled="${CURRICULUM_ENABLED:-false}"
 curriculum_epsilon="${CURRICULUM_EPSILON:-0.3}"
 
+# SEC (Self-Evolving Curriculum) — mutually exclusive with CURRICULUM_ENABLED.
+# SEC_ENABLED=true  → SECSampler with MATH Level 1-5 categories + online Q update
+# SEC_ENABLED=false → use CURRICULUM_ENABLED / uniform baseline
+sec_enabled="${SEC_ENABLED:-false}"
+sec_q_alpha="${SEC_Q_ALPHA:-0.1}"
+sec_temperature="${SEC_TEMPERATURE:-1.0}"
+
+if [[ "$sec_enabled" == "true" && "$curriculum_enabled" == "true" ]]; then
+  echo "ERROR: SEC_ENABLED and CURRICULUM_ENABLED cannot both be true." >&2
+  exit 1
+fi
+
 if [[ -n "${GENERIC_COUNTERFACTUAL:-}" ]]; then
   generic_counterfactual="$GENERIC_COUNTERFACTUAL"
 elif [[ "$feedback_mode" == "generic" ]]; then
@@ -95,6 +107,9 @@ python3 -m verl.trainer.main_ppo \
     reward_model.lambda_regen=$lambda_regen \
     curriculum.enabled=$curriculum_enabled \
     curriculum.epsilon=$curriculum_epsilon \
+    sec.enabled=$sec_enabled \
+    sec.q_alpha=$sec_q_alpha \
+    sec.temperature=$sec_temperature \
     actor_rollout_ref.rollout.generic_counterfactual=$generic_counterfactual \
     actor_rollout_ref.rollout.include_generic_in_actor=False \
     critic.optim.lr=2e-6 \

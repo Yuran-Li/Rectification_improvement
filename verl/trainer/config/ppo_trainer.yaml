@@ -3,9 +3,30 @@ curriculum:
   #   Even epoch (0,2,…): uniform WITHOUT replacement; update g_i from acc_t1.
   #   Odd  epoch (1,3,…): weighted WITH replacement; g_i frozen.
   # enabled=false → identical to baseline (RandomSampler every epoch).
+  # NOTE: curriculum.enabled and sec.enabled are mutually exclusive.
   enabled: false
   epsilon: 0.3        # ε-floor: unseen / mastered / too-hard prompts all get ≥ ε/N
   log_path: null      # JSONL path; null → <default_local_dir>/curriculum_competence.jsonl
+
+sec:
+  # SEC (Self-Evolving Curriculum) using fixed MATH Level 1-5 categories.
+  # Reference: "Self-Evolving Curriculum for LLM Reasoning"
+  #
+  # Each PPO step t:
+  #   P_t(c) = softmax(Q_t / τ)
+  #   → sample batch (per-slot multinomial over 5 levels)
+  #   → rollout → compute_advantage (post-GAE-norm)
+  #   → normal PAG optimizer step
+  #   → r_t(c) = mean u_i^G for category c  (generation y0 advantage)
+  #   → Q_{t+1}(c) = (1-α)·Q_t(c) + α·r_t(c)
+  #   → P_{t+1} samples next batch
+  #
+  # sec.enabled and curriculum.enabled cannot both be True.
+  # When both are false: original PAG uniform baseline.
+  enabled: false
+  q_alpha: 0.1          # EMA learning rate for Q update
+  temperature: 1.0      # softmax temperature τ (higher → more uniform)
+  log_path: null        # JSONL path; null → <default_local_dir>/sec_q_log.jsonl
 
 data:
   tokenizer: null

@@ -48,6 +48,7 @@ from verl.utils.validation_utils import save_validation_results_to_json
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from verl.utils.dataset.curriculum_sampler import GenerationFrontierSampler
+from verl.utils.dataset.sec_sampler import SECSampler
 
 WorkerType = Type[Worker]
 
@@ -480,7 +481,49 @@ class RayPPOTrainer(object):
         ), f'dataset truncation {self.train_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
         # use sampler for better ckpt resume
         curriculum_cfg = self.config.get("curriculum", {})
-        if curriculum_cfg.get("enabled", False):
+        sec_cfg        = self.config.get("sec", {})
+
+        # SEC and frontier curriculum are mutually exclusive
+        assert not (sec_cfg.get("enabled", False) and curriculum_cfg.get("enabled", False)), (
+            "sec.enabled and curriculum.enabled cannot both be True. "
+            "Choose one curriculum strategy."
+        )
+
+        self.sec_sampler: Optional[SECSampler] = None
+
+        if sec_cfg.get("enabled", False):
+            # Build per-level index maps from the training dataset.
+            # math_level is derived from the raw "level" column in the parquet
+            # (e.g. "Level 3"). It is NOT a stored column; use "level" directly.
+            level_col = self.train_dataset.dataframe["level"]  # list[str]
+            level_to_indices: dict = {lvl: [] for lvl in range(1, 6)}
+            for ds_idx, raw_level in enumerate(level_col):
+                if isinstance(raw_level, str) and raw_level.startswith("Level "):
+                    lvl_str = raw_level.split()[-1]
+                    lvl = int(lvl_str) if lvl_str.isdigit() else 3
+                else:
+                    lvl = 3
+                level_to_indices[lvl].append(ds_idx)
+
+            for lvl, idxs in level_to_indices.items():
+                print(f"[SEC] Level {lvl}: {len(idxs)} prompts")
+
+            sec_log = sec_cfg.get("log_path") or os.path.join(
+                self.config.trainer.default_local_dir, "sec_q_log.jsonl"
+            )
+            self.sec_sampler = SECSampler(
+                level_to_indices=level_to_indices,
+                q_alpha=float(sec_cfg.get("q_alpha", 0.1)),
+                temperature=float(sec_cfg.get("temperature", 1.0)),
+                seed=int(self.config.data.get("seed", 42)),
+                log_path=sec_log,
+            )
+            # SEC bypasses StatefulDataLoader; use RandomSampler as placeholder
+            sampler = RandomSampler(data_source=self.train_dataset)
+            self.curriculum_sampler = None
+            print(f"[SEC] SECSampler enabled: α={self.sec_sampler.q_alpha}, τ={self.sec_sampler.temperature}, log={sec_log}")
+
+        elif curriculum_cfg.get("enabled", False):
             # curriculum_cfg.get("log_path", default) returns None when key exists but is null.
             # Use explicit None check so null in YAML falls back to the default path.
             log_path = curriculum_cfg.get("log_path") or os.path.join(
@@ -876,6 +919,11 @@ class RayPPOTrainer(object):
             sampler_path = os.path.join(local_global_step_folder, 'curriculum_sampler.pt')
             torch.save(self.curriculum_sampler.state_dict(), sampler_path)
 
+        # save SEC sampler state (Q[], cumulative_counts[], step)
+        if self.sec_sampler is not None:
+            sec_path = os.path.join(local_global_step_folder, 'sec_sampler.pt')
+            torch.save(self.sec_sampler.state_dict(), sec_path)
+
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir,
                                                            'latest_checkpointed_iteration.txt')
@@ -946,6 +994,16 @@ class RayPPOTrainer(object):
             else:
                 print(f"Warning: No curriculum sampler state found at {sampler_path}, g[] starts from scratch")
 
+        # load SEC sampler state
+        if self.sec_sampler is not None:
+            sec_path = os.path.join(global_step_folder, 'sec_sampler.pt')
+            if os.path.exists(sec_path):
+                sec_state = torch.load(sec_path, weights_only=False)
+                self.sec_sampler.load_state_dict(sec_state)
+                print(f"[SEC] Resumed Q={self.sec_sampler.Q.tolist()}, step={self.sec_sampler.step}")
+            else:
+                print(f"[SEC] No sampler state found at {sec_path}, Q starts from zero")
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch['attention_mask']
@@ -998,6 +1056,10 @@ class RayPPOTrainer(object):
         self.global_steps += 1
         last_val_metrics = None
 
+        # SEC: number of steps per epoch matches the DataLoader length (same compute budget).
+        _sec_steps_per_epoch = len(self.train_dataloader)
+        _sec_batch_size = self.config.data.get('gen_batch_size', self.config.data.train_batch_size)
+
         for epoch in range(self.config.trainer.total_epochs):
             if self.curriculum_sampler is not None:
                 # tell the sampler which epoch we're in so it can switch mode
@@ -1007,7 +1069,24 @@ class RayPPOTrainer(object):
                     f"[curriculum] epoch={epoch} mode={self.curriculum_sampler.mode} "
                     f"({self.curriculum_sampler.stats()['n_seen']}/{self.curriculum_sampler.N} seen)"
                 )
-            for batch_dict in self.train_dataloader:
+
+            # SEC: build an on-demand iterator that yields batch_dicts constructed
+            # using the current Q-values (updated at the END of each step below).
+            # This completely replaces StatefulDataLoader iteration to avoid prefetch.
+            if self.sec_sampler is not None:
+                def _sec_batch_iter(sec_sampler, dataset, batch_size, steps):
+                    from verl.utils.dataset.rl_dataset import collate_fn as _cfn
+                    for _ in range(steps):
+                        indices = sec_sampler.sample_batch(batch_size)
+                        items = [dataset[int(i)] for i in indices]
+                        yield _cfn(items)
+                _batch_source = _sec_batch_iter(
+                    self.sec_sampler, self.train_dataset, _sec_batch_size, _sec_steps_per_epoch
+                )
+            else:
+                _batch_source = self.train_dataloader
+
+            for batch_dict in _batch_source:
                 metrics = {}
                 timing_raw = {}
 
@@ -1158,6 +1237,45 @@ class RayPPOTrainer(object):
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n,
                                                   norm_type=self.config.algorithm.norm_type)
 
+                        # ── SEC: cache r_t(c) AFTER advantages are ready ──────────
+                        # advantages = post-GAE-norm tensor actually used by the actor.
+                        # r_t(c) is computed here (BEFORE optimizer step) and applied
+                        # to update Q AFTER the optimizer step, implementing the
+                        # correct semantic: P_t→batch t→advantages→PAG update→Q_{t+1}.
+                        _sec_r_per_level: dict = {}
+                        if self.sec_sampler is not None:
+                            _adv     = batch.batch['advantages']         # (B*K, seq_len)
+                            _mt_mask = batch.batch['multiturn_mask']     # (B*K, seq_len)
+                            # Build turn-1 mask (y0 tokens only)
+                            _turn_starts = _mt_mask & (~torch.roll(_mt_mask, 1, dims=1))
+                            _turn_starts[:, 0] = _mt_mask[:, 0]
+                            _turn_idx = torch.cumsum(_turn_starts.long(), dim=1)
+                            _turn1_mask = (_turn_idx == 1) & _mt_mask   # (B*K, seq_len)
+
+                            _levels_BK = batch.non_tensor_batch.get('math_level', None)
+                            if _levels_BK is not None:
+                                _levels_BK = np.asarray(_levels_BK, dtype=np.int32)
+                                _sec_r_per_level = SECSampler.compute_r_per_level(
+                                    advantages=_adv,
+                                    turn1_mask=_turn1_mask,
+                                    levels=_levels_BK,
+                                    num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                )
+
+                            # Diagnostic: log |A| per level for all three turns
+                            for _turn_num, _turn_name in [(1, 'generate'), (2, 'verify'), (3, 'rectify')]:
+                                _tmask = (_turn_idx == _turn_num) & _mt_mask
+                                _t_len = _tmask.float().sum(dim=1).clamp(min=1.)
+                                _u_t   = (_adv.abs() * _tmask.float()).sum(dim=1) / _t_len  # (B*K,)
+                                _u_p   = _u_t.view(-1, self.config.actor_rollout_ref.rollout.n).mean(1)  # (B,)
+                                _lvls_B = _levels_BK[::self.config.actor_rollout_ref.rollout.n] if _levels_BK is not None else None
+                                if _lvls_B is not None:
+                                    for _lvl in range(1, 6):
+                                        _m = (_lvls_B == _lvl)
+                                        if _m.any():
+                                            metrics[f'sec/A_{_turn_name}_level_{_lvl}'] = float(
+                                                _u_p[torch.tensor(_m)].mean().item())
+
                     # update critic
                     if self.use_critic:
                         with _timer('update_critic', timing_raw):
@@ -1172,6 +1290,27 @@ class RayPPOTrainer(object):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
+
+                    # ── SEC: update Q_{t+1} AFTER the PAG optimizer step ────────
+                    # Semantic: P_t → batch t → advantages → PAG update → Q_{t+1}
+                    # _sec_r_per_level was cached BEFORE the optimizer step above.
+                    if self.sec_sampler is not None and _sec_r_per_level:
+                        self.sec_sampler.update(_sec_r_per_level, step=self.global_steps)
+                        _sec_stats = self.sec_sampler.stats()
+                        total_counts = max(1, int(_sec_stats['cumulative_counts'].sum()))
+                        sampled_lvls = (batch.non_tensor_batch.get('math_level', np.array([])) if
+                                        batch.non_tensor_batch is not None else np.array([]))
+                        sampled_lvls = sampled_lvls[::self.config.actor_rollout_ref.rollout.n]  # original prompts
+                        for _lvl in range(1, 6):
+                            metrics[f'sec/Q_level_{_lvl}'] = float(_sec_stats['Q'][_lvl - 1])
+                            metrics[f'sec/P_level_{_lvl}'] = float(_sec_stats['P'][_lvl - 1])
+                            metrics[f'sec/reward_level_{_lvl}'] = float(_sec_r_per_level.get(_lvl, float('nan')))
+                            metrics[f'sec/batch_count_level_{_lvl}'] = int(
+                                (sampled_lvls == _lvl).sum() if len(sampled_lvls) > 0 else 0)
+                            metrics[f'sec/cumulative_frac_level_{_lvl}'] = float(
+                                _sec_stats['cumulative_counts'][_lvl - 1] / total_counts)
+                        if len(sampled_lvls) > 0:
+                            metrics['sec/mean_sampled_level'] = float(sampled_lvls.mean())
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
