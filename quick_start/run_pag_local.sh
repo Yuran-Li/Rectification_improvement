@@ -52,10 +52,12 @@ policy_rs=True
 rs_coef=1.0
 norm_type=role
 split_verify_reward=True
-# generic | regen | delta
+# generic | regen | delta | acc | disc
 #   generic: R_self - R_generic (needs y_generic fork)
 #   regen:   Δ_self * [1 + λ (1 - p_regen)]
 #   delta:   Δ_self = acc_t2 - acc_t1
+#   acc:     acc_t2 - λ_cw · 1[C→W]
+#   disc:    R_use = 0 (original PAG: verify = genrm_score only)
 # Compat: LAMBDA_REGEN>0 without FEEDBACK_MODE still means delta.
 if [[ -n "${FEEDBACK_MODE:-}" ]]; then
   feedback_mode="$FEEDBACK_MODE"
@@ -69,9 +71,12 @@ case "$feedback_mode" in
   generic|critique|r_critique) feedback_mode=generic ;;
   regen) feedback_mode=regen ;;
   delta|base|delta_self) feedback_mode=delta ;;
-  *) echo "FEEDBACK_MODE must be generic|regen|delta (got: $feedback_mode)" >&2; exit 1 ;;
+  acc|acc_t2|acc_cw) feedback_mode=acc ;;
+  disc|none|pag|disc_only) feedback_mode=disc ;;
+  *) echo "FEEDBACK_MODE must be generic|regen|delta|acc|disc (got: $feedback_mode)" >&2; exit 1 ;;
 esac
 lambda_regen="${LAMBDA_REGEN:-1.0}"
+lambda_cw="${LAMBDA_CW:-0.2}"
 
 # Curriculum sampling (generation-frontier).
 curriculum_enabled="${CURRICULUM_ENABLED:-false}"
@@ -138,6 +143,7 @@ python3 -m verl.trainer.main_ppo \
     reward_model.split_verify_reward=$split_verify_reward \
     reward_model.feedback_mode=$feedback_mode \
     reward_model.lambda_regen=$lambda_regen \
+    reward_model.lambda_cw=$lambda_cw \
     curriculum.enabled=$curriculum_enabled \
     curriculum.epsilon=$curriculum_epsilon \
     actor_rollout_ref.rollout.generic_counterfactual=$generic_counterfactual \

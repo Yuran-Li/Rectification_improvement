@@ -29,12 +29,17 @@ def critique_advantage(acc_self: float, acc_generic: float) -> float:
     return float(acc_self) - float(acc_generic)
 
 
-FEEDBACK_MODES = ("generic", "regen", "delta")
+FEEDBACK_MODES = ("generic", "regen", "delta", "acc", "disc")
 _FEEDBACK_MODE_ALIASES = {
     "base": "delta",
     "delta_self": "delta",
     "critique": "generic",
     "r_critique": "generic",
+    "acc_t2": "acc",
+    "acc_cw": "acc",
+    "none": "disc",
+    "pag": "disc",
+    "disc_only": "disc",
 }
 
 
@@ -49,7 +54,7 @@ def _as_feedback_mode(value) -> Optional[str]:
 
 
 def resolve_feedback_mode(config: Optional[Dict[str, Any]] = None) -> str:
-    """generic | regen | delta.
+    """generic | regen | delta | acc | disc.
 
     Priority: ``feedback_mode``, then ``lambda_regen`` as a mode name, then
     numeric ``lambda_regen>0`` → delta (compat with LAMBDA_REGEN=1.0), else
@@ -92,6 +97,24 @@ def regen_aware_feedback_reward(delta_self: float, p_regen: float = 0.0, lambda_
 def delta_feedback_reward(delta_self: float) -> float:
     """R_feedback for feedback_mode=delta: Δ_self = acc_t2 - acc_t1."""
     return float(delta_self)
+
+
+def acc_t2_cw_feedback_reward(
+    acc_t2: float, acc_t1: float, lambda_cw: float = 0.2
+) -> float:
+    """R_use = acc_t2 - λ · 1[C→W]. λ only applies when t1 is correct and t2 is wrong."""
+    acc_t2_f = float(acc_t2)
+    c_to_w = 1.0 if (float(acc_t1) >= 0.5 and acc_t2_f < 0.5) else 0.0
+    return acc_t2_f - float(lambda_cw) * c_to_w
+
+
+def _lambda_cw_scale(config: Optional[Dict[str, Any]] = None) -> float:
+    config = config or {}
+    raw = config.get("lambda_cw", 0.2)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.2
 
 
 def prompt_group_ids(data: DataProto) -> List[str]:
@@ -281,6 +304,8 @@ class PAGRewardManager:
         generic: R_critique = R_y(y_self) - R_y(y_generic)
         regen:   R_feedback = Δ_self * [1 + λ (1 - p_regen)]
         delta:   R_feedback = Δ_self = acc_t2 - acc_t1 ∈ {+1, 0, -1}
+        acc:     R_use = acc_t2 - λ_cw · 1[C→W]  (λ_cw = lambda_cw)
+        disc:    R_use = 0 (original PAG: only R_disc / genrm_score on verify)
       rectifier last token is unchanged: acc + optional policy_rs shaping
     """
 
@@ -299,6 +324,7 @@ class PAGRewardManager:
         self.generic_counterfactual = requested_cf
         self.feedback_mode = resolve_feedback_mode(config)
         self.lambda_regen = _lambda_regen_scale(config)
+        self.lambda_cw = _lambda_cw_scale(config)
         if self.feedback_mode == "generic":
             if not requested_cf:
                 print(
@@ -312,7 +338,7 @@ class PAGRewardManager:
                 "Warning: generic_counterfactual=True requires split_verify_reward=True "
                 "to place R_critique on the self-feedback span; R_critique will not be used."
             )
-        if self.feedback_mode in ("regen", "delta") and not self.split_verify_reward:
+        if self.feedback_mode in ("regen", "delta", "acc") and not self.split_verify_reward:
             print(
                 "Warning: feedback_mode="
                 f"{self.feedback_mode} is intended for the verifier-feedback token "
@@ -562,6 +588,18 @@ class PAGRewardManager:
                     r_feedback = delta_feedback_reward(delta)
                     r_critique = r_feedback
                     r_use = r_feedback
+                elif self.feedback_mode == "acc":
+                    r_feedback = acc_t2_cw_feedback_reward(
+                        float(policy_result["acc"]),
+                        float(prev_acc),
+                        self.lambda_cw,
+                    )
+                    r_critique = r_feedback
+                    r_use = r_feedback
+                elif self.feedback_mode == "disc":
+                    r_feedback = 0.0
+                    r_critique = 0.0
+                    r_use = 0.0
                 elif self.feedback_mode == "generic":
                     if acc_generic is not None:
                         r_critique = critique_advantage(
@@ -654,8 +692,11 @@ class PAGRewardManager:
             acc_t2=reward_extra_info["acc_t2"],
         ))
         metrics["lambda_regen"] = float(self.lambda_regen)
+        metrics["lambda_cw"] = float(self.lambda_cw)
         metrics["feedback_mode_id"] = float(
-            {"generic": 0.0, "regen": 1.0, "delta": 2.0}.get(self.feedback_mode, -1.0)
+            {"generic": 0.0, "regen": 1.0, "delta": 2.0, "acc": 3.0, "disc": 4.0}.get(
+                self.feedback_mode, -1.0
+            )
         )
         if reward_extra_info.get("delta_self"):
             ds = np.asarray(reward_extra_info["delta_self"], dtype=np.float64)

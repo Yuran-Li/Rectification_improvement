@@ -221,10 +221,12 @@ reward_model:
   # True: R_disc at last verdict token, R_use at last feedback token (GAE γ=1)
   split_verify_reward: False
   generic_counterfactual: ${actor_rollout_ref.rollout.generic_counterfactual}
-  # generic | regen | delta  (see reward_model.feedback_mode)
+  # generic | regen | delta | acc | disc  (see reward_model.feedback_mode)
   feedback_mode: generic
   # scale for feedback_mode=regen only: Δ_self * [1 + λ (1 - p_regen)]
   lambda_regen: 1.0
+  # scale for feedback_mode=acc: R_use = acc_t2 - λ_cw · 1[C→W]
+  lambda_cw: 0.2
   compute_score: null
 
 custom_reward_function:
