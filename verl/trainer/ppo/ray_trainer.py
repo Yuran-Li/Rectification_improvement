@@ -47,6 +47,7 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.utils.validation_utils import save_validation_results_to_json
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
+from verl.utils.dataset.curriculum_sampler import GenerationFrontierSampler
 
 WorkerType = Type[Worker]
 
@@ -478,12 +479,33 @@ class RayPPOTrainer(object):
             'truncation', 'error'
         ), f'dataset truncation {self.train_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
         # use sampler for better ckpt resume
-        if self.config.data.shuffle:
+        curriculum_cfg = self.config.get("curriculum", {})
+        if curriculum_cfg.get("enabled", False):
+            # curriculum_cfg.get("log_path", default) returns None when key exists but is null.
+            # Use explicit None check so null in YAML falls back to the default path.
+            log_path = curriculum_cfg.get("log_path") or os.path.join(
+                self.config.trainer.default_local_dir, "curriculum_competence.jsonl"
+            )
+            self.curriculum_sampler = GenerationFrontierSampler(
+                n_total=len(self.train_dataset),
+                epsilon=float(curriculum_cfg.get("epsilon", 0.3)),
+                seed=int(self.config.data.get("seed", 42)),
+                log_path=log_path,
+            )
+            sampler = self.curriculum_sampler
+            print(
+                f"[curriculum] GenerationFrontierSampler enabled: "
+                f"N={len(self.train_dataset)}, epsilon={self.curriculum_sampler.epsilon}, "
+                f"log={log_path}"
+            )
+        elif self.config.data.shuffle:
             train_dataloader_generator = torch.Generator()
             train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
             sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
+            self.curriculum_sampler = None
         else:
             sampler = SequentialSampler(data_source=self.train_dataset)
+            self.curriculum_sampler = None
 
         self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
                                                    batch_size=self.config.data.get('gen_batch_size',
@@ -849,6 +871,11 @@ class RayPPOTrainer(object):
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
+        # save curriculum sampler state (g[], n_seen[], epoch, mode)
+        if self.curriculum_sampler is not None:
+            sampler_path = os.path.join(local_global_step_folder, 'curriculum_sampler.pt')
+            torch.save(self.curriculum_sampler.state_dict(), sampler_path)
+
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir,
                                                            'latest_checkpointed_iteration.txt')
@@ -908,6 +935,17 @@ class RayPPOTrainer(object):
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
+        # load curriculum sampler state
+        if self.curriculum_sampler is not None:
+            sampler_path = os.path.join(global_step_folder, 'curriculum_sampler.pt')
+            if os.path.exists(sampler_path):
+                sampler_state = torch.load(sampler_path, weights_only=False)
+                self.curriculum_sampler.load_state_dict(sampler_state)
+                print(f"[curriculum] Resumed sampler state: epoch={self.curriculum_sampler.epoch}, "
+                      f"n_seen={self.curriculum_sampler.n_seen.sum()}, mode={self.curriculum_sampler.mode}")
+            else:
+                print(f"Warning: No curriculum sampler state found at {sampler_path}, g[] starts from scratch")
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch['attention_mask']
@@ -961,6 +999,14 @@ class RayPPOTrainer(object):
         last_val_metrics = None
 
         for epoch in range(self.config.trainer.total_epochs):
+            if self.curriculum_sampler is not None:
+                # tell the sampler which epoch we're in so it can switch mode
+                # even epoch → uniform refresh (update g); odd → curriculum freeze (g frozen)
+                self.curriculum_sampler.set_epoch(epoch)
+                print(
+                    f"[curriculum] epoch={epoch} mode={self.curriculum_sampler.mode} "
+                    f"({self.curriculum_sampler.stats()['n_seen']}/{self.curriculum_sampler.N} seen)"
+                )
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
@@ -1063,6 +1109,36 @@ class RayPPOTrainer(object):
                         print(f'{list(reward_extra_infos_dict.keys())=}')
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                        # curriculum sampler update.
+                        # update() is a no-op in curriculum (odd) epochs — g is frozen.
+                        # In uniform (even) epochs it refreshes g[i] = mean(acc_t1 over n rollouts).
+                        if self.curriculum_sampler is not None:
+                            _idx = batch.non_tensor_batch.get('index', None)
+                            _acc = batch.non_tensor_batch.get('acc_t1', None)
+                            if _idx is not None and _acc is not None:
+                                _idx = np.asarray(_idx, dtype=np.int64).ravel()
+                                _acc = np.asarray(_acc, dtype=np.float32).ravel()
+                                # aggregate n rollouts → one g_i per unique prompt
+                                _uniq, _inv = np.unique(_idx, return_inverse=True)
+                                _g_per_prompt = np.array(
+                                    [_acc[_inv == k].mean() for k in range(len(_uniq))],
+                                    dtype=np.float32,
+                                )
+                                # mode check lives inside update() — no-op when mode=="curriculum"
+                                self.curriculum_sampler.update(_uniq, _g_per_prompt, self.global_steps)
+                            if self.global_steps % 10 == 0:
+                                _stats = self.curriculum_sampler.stats()
+                                metrics['curriculum/mode']         = 0 if _stats['mode'] == 'uniform' else 1
+                                metrics['curriculum/n_seen']       = _stats['n_seen']
+                                metrics['curriculum/g_mean_seen']  = _stats['g_mean_seen'] if not np.isnan(_stats['g_mean_seen']) else 0.0
+                                metrics['curriculum/frontier_frac']= _stats['frontier_frac']
+                                # per-bin histogram: N prompts in each g bucket (K=4 → {0,.25,.5,.75,1})
+                                metrics['curriculum/n_g0']   = _stats['n_g0']
+                                metrics['curriculum/n_g025'] = _stats['n_g025']
+                                metrics['curriculum/n_g050'] = _stats['n_g050']
+                                metrics['curriculum/n_g075'] = _stats['n_g075']
+                                metrics['curriculum/n_g100'] = _stats['n_g100']
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:

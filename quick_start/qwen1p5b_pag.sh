@@ -7,11 +7,11 @@ aime2025=datasets/aime2025.parquet
 minervamath=datasets/minervamath.parquet
 dapo17k=datasets/dapo17k.parquet
 
-PROJECT_NAME='PAG'
-CKPT_PATH=checkpoints
-MODEL_PATH=Qwen/Qwen2.5-1.5B-Instruct
+PROJECT_NAME="${PROJECT_NAME:-PAG}"
+CKPT_PATH="${CKPT_PATH:-checkpoints}"
+MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}"
 
-EXPERIMENT_NAME="qwen1p5b_pag"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen1p5b_pag}"
 n=4
 rollout_type=pag
 num_turns=2
@@ -19,9 +19,37 @@ policy_rs=True
 rs_coef=1.0
 norm_type=role
 split_verify_reward=True
-generic_counterfactual="${GENERIC_COUNTERFACTUAL:-True}"
-# 0 = keep R_self - R_generic. Set LAMBDA_REGEN=1.0 for Δ_self * [1+λ(1-p_regen)].
-lambda_regen="${LAMBDA_REGEN:-0.0}"
+# generic | regen | delta
+# Compat: LAMBDA_REGEN>0 without FEEDBACK_MODE still means delta.
+if [[ -n "${FEEDBACK_MODE:-}" ]]; then
+  feedback_mode="$FEEDBACK_MODE"
+else
+  case "${LAMBDA_REGEN:-0}" in
+    0|0.0|0.00) feedback_mode=generic ;;
+    *) feedback_mode=delta ;;
+  esac
+fi
+case "$feedback_mode" in
+  generic|critique|r_critique) feedback_mode=generic ;;
+  regen) feedback_mode=regen ;;
+  delta|base|delta_self) feedback_mode=delta ;;
+  *) echo "FEEDBACK_MODE must be generic|regen|delta (got: $feedback_mode)" >&2; exit 1 ;;
+esac
+lambda_regen="${LAMBDA_REGEN:-1.0}"
+
+# Curriculum sampling (generation-frontier).
+# CURRICULUM_ENABLED=true  → GenerationFrontierSampler
+# CURRICULUM_ENABLED=false → uniform RandomSampler (baseline)
+curriculum_enabled="${CURRICULUM_ENABLED:-false}"
+curriculum_epsilon="${CURRICULUM_EPSILON:-0.3}"
+
+if [[ -n "${GENERIC_COUNTERFACTUAL:-}" ]]; then
+  generic_counterfactual="$GENERIC_COUNTERFACTUAL"
+elif [[ "$feedback_mode" == "generic" ]]; then
+  generic_counterfactual=True
+else
+  generic_counterfactual=False
+fi
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=gae \
@@ -31,7 +59,7 @@ python3 -m verl.trainer.main_ppo \
     data.train_batch_size=512 \
     data.max_prompt_length=1024 \
     data.max_response_length=2048 \
-    actor_rollout_ref.model.path=$MODEL_PATH \
+    "actor_rollout_ref.model.path='${MODEL_PATH}'" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=32768 \
@@ -63,13 +91,16 @@ python3 -m verl.trainer.main_ppo \
     reward_model.policy_rs=$policy_rs \
     reward_model.rs_coef=$rs_coef \
     reward_model.split_verify_reward=$split_verify_reward \
+    reward_model.feedback_mode=$feedback_mode \
     reward_model.lambda_regen=$lambda_regen \
+    curriculum.enabled=$curriculum_enabled \
+    curriculum.epsilon=$curriculum_epsilon \
     actor_rollout_ref.rollout.generic_counterfactual=$generic_counterfactual \
     actor_rollout_ref.rollout.include_generic_in_actor=False \
     critic.optim.lr=2e-6 \
     critic.use_dynamic_bsz=True \
     critic.model.use_remove_padding=True \
-    critic.model.path=$MODEL_PATH \
+    "critic.model.path='${MODEL_PATH}'" \
     critic.model.fsdp_config.param_offload=False \
     critic.model.fsdp_config.optimizer_offload=False \
     algorithm.use_kl_in_reward=False \
@@ -85,4 +116,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.default_local_dir=$CKPT_PATH/$PROJECT_NAME/$EXPERIMENT_NAME \
     trainer.val_before_train=True \
     trainer.resume_mode=auto \
-    trainer.log_val_generations=2
+    trainer.log_val_generations=2 \
+    "$@"

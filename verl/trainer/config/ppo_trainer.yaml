@@ -1,3 +1,12 @@
+curriculum:
+  # Generation-frontier curriculum sampling (U→C→U→C alternating epochs).
+  #   Even epoch (0,2,…): uniform WITHOUT replacement; update g_i from acc_t1.
+  #   Odd  epoch (1,3,…): weighted WITH replacement; g_i frozen.
+  # enabled=false → identical to baseline (RandomSampler every epoch).
+  enabled: false
+  epsilon: 0.3        # ε-floor: unseen / mastered / too-hard prompts all get ≥ ε/N
+  log_path: null      # JSONL path; null → <default_local_dir>/curriculum_competence.jsonl
+
 data:
   tokenizer: null
   train_files: ~/data/rlhf/gsm8k/train.parquet
@@ -191,8 +200,10 @@ reward_model:
   # True: R_disc at last verdict token, R_use at last feedback token (GAE γ=1)
   split_verify_reward: False
   generic_counterfactual: ${actor_rollout_ref.rollout.generic_counterfactual}
-  # >0: R_feedback = Δ_self * [1 + λ (1 - p_regen)]; 0 keeps R_self - R_generic
-  lambda_regen: 0.0
+  # generic | regen | delta  (see reward_model.feedback_mode)
+  feedback_mode: generic
+  # scale for feedback_mode=regen only: Δ_self * [1 + λ (1 - p_regen)]
+  lambda_regen: 1.0
   compute_score: null
 
 custom_reward_function:

@@ -72,8 +72,9 @@ These changes sit on top of the original PAG loop (`n=4` independent `y0` sample
 | Signal | Token | Formula |
 |--------|--------|---------|
 | `R_disc` | last verdict token | GenRM score (correct/wrong vs GT) |
-| `R_critique` (default `lambda_regen=0`) | last self-feedback token | `R_y(y_self) - R_y(y_generic)` in `{+1, 0, -1}` |
-| `R_feedback` (`lambda_regen>0`) | last self-feedback token | `Δ_self * [1 + λ (1 - p_regen)]`; `Δ_self = acc_t2 - acc_t1` ∈ `{+1,0,-1}` (C→C is 0, C→W is −1); generic unused |
+| `R_critique` (`feedback_mode=generic`) | last self-feedback token | `R_y(y_self) - R_y(y_generic)` in `{+1, 0, -1}` |
+| `R_feedback` (`feedback_mode=regen`) | last self-feedback token | `Δ_self * [1 + λ (1 - p_regen)]`; `λ` = `lambda_regen` |
+| `R_feedback` (`feedback_mode=delta`) | last self-feedback token | `Δ_self = acc_t2 - acc_t1` ∈ `{+1,0,-1}` (C→C is 0, C→W is −1); generic unused |
 | `R_rect` | last rectifier token | `R_y(y_self) + rs_coef * Δ_self` (`policy_rs` unchanged) |
 
 No rectify ⇒ no generic fork ⇒ no `R_critique`. User-template gaps (`multiturn_mask=False`) still zero GAE into `y0`.
@@ -115,15 +116,22 @@ N_GPUS=8 bash quick_start/run_pag_local.sh
 
 Override with `TRAIN_DATASET=/path/to.parquet`. Other flags: `USE_WANDB=1`, `EXPERIMENT_NAME=...`, `GPU_MEM_UTIL=0.6`, `CUDA_VISIBLE_DEVICES=...`.
 
-Regen-aware verifier feedback (`R_feedback`, no generic contrast):
+Verifier feedback (`reward_model.feedback_mode`, default `generic`):
 
 ```bash
-LAMBDA_REGEN=1.0 GENERIC_COUNTERFACTUAL=False N_GPUS=8 bash quick_start/run_pag_local.sh
-# or Hydra on main_ppo:
-#   reward_model.lambda_regen=1.0 actor_rollout_ref.rollout.generic_counterfactual=False
+# Δ_self only (no y_generic fork)
+FEEDBACK_MODE=delta N_GPUS=8 bash quick_start/run_pag_local.sh
+# Δ_self * [1 + λ(1-p_regen)]
+FEEDBACK_MODE=regen LAMBDA_REGEN=1.0 N_GPUS=8 bash quick_start/run_pag_local.sh
+# R_self - R_generic (samples y_generic)
+FEEDBACK_MODE=generic N_GPUS=8 bash quick_start/run_pag_local.sh
+# or Hydra:
+#   reward_model.feedback_mode=delta
+#   reward_model.feedback_mode=regen reward_model.lambda_regen=1.0
+#   reward_model.feedback_mode=generic actor_rollout_ref.rollout.generic_counterfactual=True
 ```
 
-`generic_counterfactual=False` skips the extra `y_generic` rollout (kept for ablation when True). Default `lambda_regen=0` is the old `R_self - R_generic`.
+`FEEDBACK_MODE=generic` turns on the extra `y_generic` rollout. `regen` / `delta` skip it unless you set `GENERIC_COUNTERFACTUAL=True` (logging only). `lambda_regen` is the regen weight, not the mode switch.
 
 Unit tests: `PYTHONPATH=. python tests/test_split_verify_reward.py` (PAG env).
 

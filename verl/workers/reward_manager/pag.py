@@ -29,12 +29,69 @@ def critique_advantage(acc_self: float, acc_generic: float) -> float:
     return float(acc_self) - float(acc_generic)
 
 
-def regen_aware_feedback_reward(delta_self: float, p_regen: float, lambda_regen: float) -> float:
-    """R_feedback = Δ_self * [1 + lambda_regen * (1 - p_regen)].
+FEEDBACK_MODES = ("generic", "regen", "delta")
+_FEEDBACK_MODE_ALIASES = {
+    "base": "delta",
+    "delta_self": "delta",
+    "critique": "generic",
+    "r_critique": "generic",
+}
 
-    Δ_self = acc_t2 - acc_t1 ∈ {-1, 0, +1}. Never subtracts generic/regen.
+
+def _as_feedback_mode(value) -> Optional[str]:
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if not s:
+        return None
+    s = _FEEDBACK_MODE_ALIASES.get(s, s)
+    return s if s in FEEDBACK_MODES else None
+
+
+def resolve_feedback_mode(config: Optional[Dict[str, Any]] = None) -> str:
+    """generic | regen | delta.
+
+    Priority: ``feedback_mode``, then ``lambda_regen`` as a mode name, then
+    numeric ``lambda_regen>0`` → delta (compat with LAMBDA_REGEN=1.0), else
+    generic if the counterfactual fork is on, else policy_rs shaping.
     """
+    config = config or {}
+    mode = _as_feedback_mode(config.get("feedback_mode"))
+    if mode:
+        return mode
+    mode = _as_feedback_mode(config.get("lambda_regen"))
+    if mode:
+        return mode
+    try:
+        lam = float(config.get("lambda_regen", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        lam = 0.0
+    if lam > 0.0:
+        return "delta"
+    if bool(config.get("generic_counterfactual", False)):
+        return "generic"
+    return "policy_rs"
+
+
+def _lambda_regen_scale(config: Optional[Dict[str, Any]] = None) -> float:
+    config = config or {}
+    raw = config.get("lambda_regen", 1.0)
+    if _as_feedback_mode(raw):
+        return 1.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def regen_aware_feedback_reward(delta_self: float, p_regen: float = 0.0, lambda_regen: float = 1.0) -> float:
+    """R_feedback for feedback_mode=regen: Δ_self * [1 + λ (1 - p_regen)]."""
     return float(delta_self) * (1.0 + float(lambda_regen) * (1.0 - float(p_regen)))
+
+
+def delta_feedback_reward(delta_self: float) -> float:
+    """R_feedback for feedback_mode=delta: Δ_self = acc_t2 - acc_t1."""
+    return float(delta_self)
 
 
 def prompt_group_ids(data: DataProto) -> List[str]:
@@ -220,12 +277,10 @@ class PAGRewardManager:
 
     split_verify_reward=True:
       R_disc = genrm_score at last verdict token (GAE γ=1 also credits feedback)
-      R_use  = usefulness at last feedback token:
-        lambda_regen > 0: R_feedback = Δ_self * [1 + λ (1 - p_regen)]
-          Δ_self = acc_t2 - acc_t1; p_regen = LOO turn-1 pass rate on the same uid.
-          Generic is not used in this reward. Rectifier is unchanged.
-        else generic_counterfactual: R_critique = R_y(y_self) - R_y(y_generic)
-        else if policy_rs: rs_coef * (acc_t2 - acc_t1)
+      R_use  = usefulness at last feedback token, selected by feedback_mode:
+        generic: R_critique = R_y(y_self) - R_y(y_generic)
+        regen:   R_feedback = Δ_self * [1 + λ (1 - p_regen)]
+        delta:   R_feedback = Δ_self = acc_t2 - acc_t1 ∈ {+1, 0, -1}
       rectifier last token is unchanged: acc + optional policy_rs shaping
     """
 
@@ -240,16 +295,27 @@ class PAGRewardManager:
         self.end_with_verifer = config.get('end_with_verifer', False)
         # Split R_disc (verdict last token) vs R_use (feedback last token).
         self.split_verify_reward = bool(config.get('split_verify_reward', False))
-        self.generic_counterfactual = bool(config.get('generic_counterfactual', False))
-        self.lambda_regen = float(config.get('lambda_regen', 0.0))
+        requested_cf = bool(config.get('generic_counterfactual', False))
+        self.generic_counterfactual = requested_cf
+        self.feedback_mode = resolve_feedback_mode(config)
+        self.lambda_regen = _lambda_regen_scale(config)
+        if self.feedback_mode == "generic":
+            if not requested_cf:
+                print(
+                    "Warning: feedback_mode=generic needs "
+                    "actor_rollout_ref.rollout.generic_counterfactual=True to sample "
+                    "y_generic; R_critique is 0 if generic_response is missing."
+                )
+            self.generic_counterfactual = True
         if self.generic_counterfactual and not self.split_verify_reward:
             print(
                 "Warning: generic_counterfactual=True requires split_verify_reward=True "
                 "to place R_critique on the self-feedback span; R_critique will not be used."
             )
-        if self.lambda_regen > 0.0 and not self.split_verify_reward:
+        if self.feedback_mode in ("regen", "delta") and not self.split_verify_reward:
             print(
-                "Warning: lambda_regen>0 is intended for the verifier-feedback token "
+                "Warning: feedback_mode="
+                f"{self.feedback_mode} is intended for the verifier-feedback token "
                 "(split_verify_reward=True); otherwise R_feedback is added on the verdict token."
             )
 
@@ -390,7 +456,7 @@ class PAGRewardManager:
             r_self = 0.0
             r_feedback = 0.0
             delta_self = 0.0
-            regen_weight = 1.0 + self.lambda_regen * (1.0 - float(p_regen[i]))
+            regen_weight = 1.0
             verify_text = ""
             generic_text_export = ""
                 
@@ -472,7 +538,7 @@ class PAGRewardManager:
                 delta_self = delta
                 if self.policy_rs:
                     reward_value += self.rs_coef * delta
-                # Optional generic scoring (logging / ablation only when lambda_regen>0)
+                # Generic scoring: used by feedback_mode=generic; otherwise logging only.
                 if self.generic_counterfactual:
                     generic_text = data_item.non_tensor_batch.get("generic_response", "") or ""
                     if isinstance(generic_text, bytes):
@@ -484,14 +550,19 @@ class PAGRewardManager:
                             solution_str=generic_text, ground_truth=ground_truth
                         )
                         acc_generic = float(generic_result["acc"])
-                if self.lambda_regen > 0.0:
-                    r_self = 1.0 if float(policy_result["acc"]) >= 0.5 else 0.0
+                r_self = 1.0 if float(policy_result["acc"]) >= 0.5 else 0.0
+                if self.feedback_mode == "regen":
+                    regen_weight = 1.0 + self.lambda_regen * (1.0 - float(p_regen[i]))
                     r_feedback = regen_aware_feedback_reward(
                         delta, float(p_regen[i]), self.lambda_regen
                     )
                     r_critique = r_feedback
                     r_use = r_feedback
-                elif self.generic_counterfactual:
+                elif self.feedback_mode == "delta":
+                    r_feedback = delta_feedback_reward(delta)
+                    r_critique = r_feedback
+                    r_use = r_feedback
+                elif self.feedback_mode == "generic":
                     if acc_generic is not None:
                         r_critique = critique_advantage(
                             float(policy_result["acc"]), acc_generic
@@ -583,6 +654,9 @@ class PAGRewardManager:
             acc_t2=reward_extra_info["acc_t2"],
         ))
         metrics["lambda_regen"] = float(self.lambda_regen)
+        metrics["feedback_mode_id"] = float(
+            {"generic": 0.0, "regen": 1.0, "delta": 2.0}.get(self.feedback_mode, -1.0)
+        )
         if reward_extra_info.get("delta_self"):
             ds = np.asarray(reward_extra_info["delta_self"], dtype=np.float64)
             rev = np.asarray(reward_extra_info.get("revised", []), dtype=bool)
