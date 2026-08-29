@@ -68,6 +68,27 @@ def get_sharding_strategy(device_mesh):
     return sharding_strategy
 
 
+def _fsdp_weight_fingerprint(module) -> float:
+    """Cheap scalar fingerprint of current FSDP actor params (post-update snapshot)."""
+    with torch.no_grad():
+        for p in module.parameters():
+            if p is None:
+                continue
+            t = p.detach()
+            if hasattr(t, "full_tensor"):
+                try:
+                    t = t.full_tensor()
+                except Exception:
+                    pass
+            flat = t.float().reshape(-1)
+            n = min(256, int(flat.numel()))
+            if n == 0:
+                continue
+            sl = flat[:n].cpu()
+            return float(sl.abs().mean()) * 1e6 + float(sl.sum())
+    return 0.0
+
+
 class ActorRolloutRefWorker(Worker):
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
@@ -520,7 +541,13 @@ class ActorRolloutRefWorker(Worker):
                 if self.generation_config is not None else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
+        is_sec_refresh = bool(prompts.meta_info.get('sec_category_refresh'))
         with self.rollout_sharding_manager:
+            refresh_fp = None
+            if is_sec_refresh:
+                # Fingerprint the FSDP actor *after* sharding-manager __enter__
+                # copied those weights into vLLM, before optional CPU offload.
+                refresh_fp = _fsdp_weight_fingerprint(self.actor_module_fsdp)
 
             # after parameters sync with rollout, offload actor model to CPU
             if self._is_offload_param:
@@ -535,6 +562,11 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage('After rollout generation', logger=logger)
 
             output = self.rollout_sharding_manager.postprocess_data(output)
+            if is_sec_refresh:
+                if output.meta_info is None:
+                    output.meta_info = {}
+                output.meta_info['rollout_weights_synced'] = True
+                output.meta_info['rollout_weight_fingerprint'] = refresh_fp
 
         output = output.to('cpu')
 

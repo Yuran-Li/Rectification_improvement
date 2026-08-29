@@ -47,11 +47,14 @@ curriculum_enabled="${CURRICULUM_ENABLED:-false}"
 curriculum_epsilon="${CURRICULUM_EPSILON:-0.3}"
 
 # SEC (Self-Evolving Curriculum) — mutually exclusive with CURRICULUM_ENABLED.
-# SEC_ENABLED=true  → SECSampler with MATH Level 1-5 categories + online Q update
+# SEC_ENABLED=true  → dynamic C1–C5 + online Q update
 # SEC_ENABLED=false → use CURRICULUM_ENABLED / uniform baseline
 sec_enabled="${SEC_ENABLED:-false}"
 sec_q_alpha="${SEC_Q_ALPHA:-0.1}"
 sec_temperature="${SEC_TEMPERATURE:-1.0}"
+sec_refresh_interval="${SEC_REFRESH_INTERVAL:-50}"
+sec_refresh_rollouts="${SEC_REFRESH_ROLLOUTS:-$n}"
+sec_initial_stats="${SEC_INITIAL_CATEGORY_STATS:-null}"
 
 if [[ "$sec_enabled" == "true" && "$curriculum_enabled" == "true" ]]; then
   echo "ERROR: SEC_ENABLED and CURRICULUM_ENABLED cannot both be true." >&2
@@ -77,8 +80,8 @@ python3 -m verl.trainer.main_ppo \
     "actor_rollout_ref.model.path='${MODEL_PATH}'" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=32768 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16384 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -114,6 +117,9 @@ python3 -m verl.trainer.main_ppo \
     sec.enabled=$sec_enabled \
     sec.q_alpha=$sec_q_alpha \
     sec.temperature=$sec_temperature \
+    sec.refresh_interval=$sec_refresh_interval \
+    sec.refresh_rollouts=$sec_refresh_rollouts \
+    sec.initial_category_stats_path=$sec_initial_stats \
     actor_rollout_ref.rollout.generic_counterfactual=$generic_counterfactual \
     actor_rollout_ref.rollout.include_generic_in_actor=False \
     critic.optim.lr=2e-6 \

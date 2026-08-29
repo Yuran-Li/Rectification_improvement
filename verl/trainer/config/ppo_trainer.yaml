@@ -9,24 +9,23 @@ curriculum:
   log_path: null      # JSONL path; null → <default_local_dir>/curriculum_competence.jsonl
 
 sec:
-  # SEC (Self-Evolving Curriculum) using fixed MATH Level 1-5 categories.
-  # Reference: "Self-Evolving Curriculum for LLM Reasoning"
+  # SEC with dynamic C1–C5 (policy-dependent g, n_WC). Sampling / |A_G| Q-update
+  # match fixed-category SEC. Membership is replaced only at synchronized refreshes.
   #
-  # Each PPO step t:
-  #   P_t(c) = softmax(Q_t / τ)
-  #   → sample batch (per-slot multinomial over 5 levels)
-  #   → rollout → compute_advantage (post-GAE-norm)
-  #   → normal PAG optimizer step
-  #   → r_t(c) = mean u_i^G for category c  (generation y0 advantage)
-  #   → Q_{t+1}(c) = (1-α)·Q_t(c) + α·r_t(c)
-  #   → P_{t+1} samples next batch
+  #   C1: g=1
+  #   C2: 0.5 ≤ g < 1, n_WC > 0
+  #   C3: 0.5 ≤ g < 1, n_WC = 0
+  #   C4: g < 0.5,     n_WC > 0
+  #   C5: g < 0.5,     n_WC = 0
   #
   # sec.enabled and curriculum.enabled cannot both be True.
-  # When both are false: original PAG uniform baseline.
   enabled: false
   q_alpha: 0.1          # EMA learning rate for Q update
   temperature: 1.0      # softmax temperature τ (higher → more uniform)
   log_path: null        # JSONL path; null → <default_local_dir>/sec_q_log.jsonl
+  refresh_interval: 50  # PPO steps between full-train synchronized refreshes
+  refresh_rollouts: 4   # K_refresh; must equal actor_rollout_ref.rollout.n
+  initial_category_stats_path: null  # optional JSON; must match refresh protocol
 
 data:
   tokenizer: null

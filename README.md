@@ -8,7 +8,8 @@
 </div>
 
 ## News
-- **[2026/08/27]** Self-Evolving Curriculum (SEC): online MATH-level bandit sampler, per-slot multinomial category sampling, generation-advantage Q-update, full WandB diagnostics
+- **[2026/08/28]** Dynamic-category SEC: C1–C5 from synchronized $(g_t, n_{WC,t})$ refreshes (this branch). Q-update and sampling are unchanged from fixed MATH-level SEC.
+- **[2026/08/27]** Self-Evolving Curriculum (SEC): online bandit sampler, per-slot multinomial category sampling, generation-advantage Q-update, full WandB diagnostics
 - **[2026/08/18]** Critique-informativeness PPO: split verifier rewards, same-`y0` generic counterfactual, pair logging (`P(CW)`, CER)
 - **[2025/06/27]** 🎉 Code released
 - **[2025/06/13]** 🎉 [HomePage](https://jackory.github.io/pag/) released
@@ -148,20 +149,30 @@ Unit tests: `PYTHONPATH=. python tests/test_split_verify_reward.py` (PAG env).
 
 ## Self-Evolving Curriculum (SEC)
 
-An optional online curriculum sampler that replaces uniform prompt sampling with a MATH-level bandit. SEC and the previous generation-frontier curriculum are **mutually exclusive**.
+An optional online curriculum sampler that replaces uniform prompt sampling with a dynamic C1–C5 bandit. SEC and the previous generation-frontier curriculum are **mutually exclusive**.
 
 ### Design
 
-SEC maintains a Q-value per MATH difficulty level (1–5) and updates it after every PPO step using the generation-turn advantage as the reward signal:
+SEC maintains a Q-value per **dynamic** category C1–C5 and updates it after every PPO step using the generation-turn advantage as the reward signal. Category membership is **not** the parquet MATH level; it is assigned from a synchronized full-train PAG measurement of the current policy:
+
+```
+C1: g = 1
+C2: 0.5 ≤ g < 1, n_WC > 0
+C3: 0.5 ≤ g < 1, n_WC = 0
+C4: g < 0.5,     n_WC > 0
+C5: g < 0.5,     n_WC = 0
+```
+
+`g = n_correct_y0 / K_refresh` and `n_WC = #{y0 wrong and rectified y2 correct}`, using the same PAG `acc >= 0.5` criteria as training. Per-prompt state is keyed by `extra_info.index`.
 
 ```
 Q_0(c) = 0  for all c
-P_t(c) = softmax(Q_t / τ)
+P_t(c) = softmax(Q_t / τ)   # empty categories masked
 
 for each batch of size B:
     for each slot b = 1..B (i.i.d., with replacement):
         c_b ~ Categorical(P_t)
-        prompt_b ~ Uniform(level_{c_b})   # with replacement
+        prompt_b ~ Uniform(C_{c_b})   # with replacement
 
     → normal PAG rollout + advantage computation
     → r_t(c) = mean u_i^G over prompts i from category c
@@ -169,25 +180,19 @@ for each batch of size B:
     → P_{t+1}
 ```
 
+Every `refresh_interval` PPO steps the trainer pauses for a **measurement** (not a uniform-training epoch): full-train PAG rollout of the current actor (FSDP weights synced into vLLM), then an atomic replace of `prompt_id → category`. Q is not reset.
+
 `u_i^G` is the mean absolute generation-turn (`y0`) advantage over the K rollout trajectories of prompt `i`:
 
 ```
 u_i^G = (1/K) Σ_k (1/T_ik^G) Σ_{t ∈ y0,ik} |A^G_{ik,t}|
 ```
 
-Only `A^G` (generation advantage) feeds the Q update. Verification and rectification advantages are logged per level for diagnostics only (`sec/A_verify_level_*`, `sec/A_rectify_level_*`).
+Only `A^G` (generation advantage) feeds the Q update. Verification and rectification advantages are logged per category for diagnostics only (`sec/A_verify_C*`, `sec/A_rectify_C*`).
 
-### Dataset categories
+### Dynamic categories
 
-Training prompts (`math7500.parquet`) are assigned permanently to one of five MATH difficulty levels. Two samples with ambiguous labels (`Level ?`) are resolved to **Level 3** based on the original MATH dataset metadata. Category membership does not change during training.
-
-| Level | Prompts |
-|-------|---------|
-| 1 | 564 |
-| 2 | 1187 |
-| 3 | 1908 |
-| 4 | 2035 |
-| 5 | 2304 |
+There is no U→C→U→C schedule. SEC stays on. Refreshes are synchronized: every prompt is measured from the same policy snapshot. Precomputed `initial_category_stats_path` JSON must embed a `protocol` block matching this run (`refresh_rollouts` / model / sampling / PAG `revise_gate`). **Do not load K=8 dumps into a K=4 run.**
 
 ### DataLoader bypass
 
@@ -199,9 +204,12 @@ Because `Q_{t+1}` must determine batch `t+1`, SEC bypasses `StatefulDataLoader` 
 # ppo_trainer.yaml
 sec:
   enabled: false
-  q_alpha: 0.1        # EMA learning rate α
-  temperature: 1.0    # softmax temperature τ
-  log_path: null      # optional JSONL log path
+  q_alpha: 0.1
+  temperature: 1.0
+  log_path: null
+  refresh_interval: 50
+  refresh_rollouts: 4          # must equal actor_rollout_ref.rollout.n
+  initial_category_stats_path: null
 ```
 
 `sec.enabled` and `curriculum.enabled` cannot both be `true` (assertion in trainer + shell guard).
@@ -211,8 +219,9 @@ sec:
 ```bash
 # SEC training (1.5B, 6 GPUs)
 SEC_ENABLED=true SEC_Q_ALPHA=0.1 SEC_TEMPERATURE=1.0 \
+  SEC_REFRESH_INTERVAL=50 SEC_REFRESH_ROLLOUTS=4 \
   FEEDBACK_MODE=delta CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
-  PROJECT_NAME="PAG-sec" EXPERIMENT_NAME="qwen1p5b_pag_sec" \
+  PROJECT_NAME="PAG-sec" EXPERIMENT_NAME="qwen1p5b_pag_sec_dynamic" \
   MODEL_PATH="Qwen/Qwen2.5-1.5B-Instruct" \
   bash quick_start/qwen1p5b_pag.sh \
     trainer.n_gpus_per_node=6 \
@@ -232,38 +241,42 @@ SEC_ENABLED=false CURRICULUM_ENABLED=false \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5
 ```
 
+Refresh wall-clock (`dynamic/refresh_wall_time_s`) and trajectory counts (`dynamic/refresh_n_trajectories`) are logged separately from training step time. The ~rollout-workload fraction at interval 50 is **not** the same as wall-clock overhead.
+
 ### WandB metrics logged per step
 
 | Metric | Description |
 |--------|-------------|
-| `sec/Q_level_{1..5}` | Current Q-values |
-| `sec/P_level_{1..5}` | Sampling probabilities |
-| `sec/reward_level_{1..5}` | `r_t(c)` used for Q update |
-| `sec/batch_count_level_{1..5}` | Number of prompts per level in this batch |
-| `sec/cumulative_frac_level_{1..5}` | Cumulative fraction of total prompts seen per level |
-| `sec/mean_sampled_level` | Mean MATH level in this batch |
-| `sec/A_generate_level_{1..5}` | Mean absolute generation advantage per level |
-| `sec/A_verify_level_{1..5}` | Mean absolute verification advantage per level (diagnostic) |
-| `sec/A_rectify_level_{1..5}` | Mean absolute rectification advantage per level (diagnostic) |
+| `sec/Q_C{1..5}` | Current Q-values |
+| `sec/P_C{1..5}` | Sampling probabilities |
+| `sec/reward_C{1..5}` | `r_t(c)` used for Q update |
+| `sec/batch_count_C{1..5}` | Number of prompts per category in this batch |
+| `sec/cumulative_frac_C{1..5}` | Cumulative fraction of total prompts seen per category |
+| `sec/mean_sampled_category` | Mean category id in this batch |
+| `sec/A_generate_C{1..5}` | Mean absolute generation advantage per category |
+| `sec/A_verify_C{1..5}` | Mean absolute verification advantage (diagnostic) |
+| `sec/A_rectify_C{1..5}` | Mean absolute rectification advantage (diagnostic) |
+
+At each synchronized refresh: `dynamic/category_count_C*`, `dynamic/category_frac_C*`, `dynamic/g_mean_C*`, `dynamic/nWC_positive_frac_C*`, `dynamic/transition_Ci_to_Cj`, `dynamic/refresh_wall_time_s`, `dynamic/refresh_n_trajectories`.
 
 ### Unit tests
 
 ```bash
-PYTHONPATH=. python tests/test_sec_sampler.py
+PYTHONPATH=. python -m pytest tests/test_sec_sampler.py -v
 ```
 
-10 deterministic tests covering: policy initialisation, sampling probabilities, within-category uniformity, absent-category Q freeze, K-trajectory regrouping, `y0`-only masking, Q→batch causality, SEC/curriculum mutual exclusivity, and baseline preservation.
+Tests cover: C1–C5 assignment, membership keyed by `extra_info.index` (not row position), migration after refresh, Q frozen across reassignment, empty-category mask, protocol-matched stats loading (K=8 dumps rejected on K=4), checkpoint restore of mapping+Q, generation-only `|A_G|`, and no U→C epoch switch.
 
 ### Key files
 
 | File | Role |
 |------|------|
-| `verl/utils/dataset/sec_sampler.py` | `SECSampler` class (sampling, Q update, checkpointing) |
-| `verl/utils/dataset/rl_dataset.py` | Adds `math_level` field; resolves `Level ?` → 3 |
-| `verl/trainer/ppo/ray_trainer.py` | SEC init, manual batch loop, Q update, logging |
+| `verl/utils/dataset/sec_sampler.py` | `SECSampler` (dynamic membership, sampling, Q update, checkpointing) |
+| `verl/trainer/ppo/ray_trainer.py` | Initial/periodic refresh, FSDP→vLLM sync, Q update, logging |
 | `verl/trainer/config/ppo_trainer.yaml` | `sec:` config block |
-| `quick_start/qwen1p5b_pag.sh` | `SEC_ENABLED`, `SEC_Q_ALPHA`, `SEC_TEMPERATURE` env vars |
-| `tests/test_sec_sampler.py` | 10 unit tests |
+| `quick_start/qwen1p5b_pag.sh` | `SEC_ENABLED`, `SEC_REFRESH_INTERVAL`, `SEC_REFRESH_ROLLOUTS` |
+| `quick_start/run_pag_local.sh` | same `sec.*` hydra args (off by default) |
+| `tests/test_sec_sampler.py` | Unit tests |
 
 ## Citation
 If you find this project helpful, please cite:

@@ -79,8 +79,22 @@ lambda_regen="${LAMBDA_REGEN:-1.0}"
 lambda_cw="${LAMBDA_CW:-0.2}"
 
 # Curriculum sampling (generation-frontier).
+# CURRICULUM_ENABLED and SEC_ENABLED cannot both be true.
 curriculum_enabled="${CURRICULUM_ENABLED:-false}"
 curriculum_epsilon="${CURRICULUM_EPSILON:-0.3}"
+
+# SEC (dynamic C1–C5). Off by default so this script stays a PAG baseline.
+sec_enabled="${SEC_ENABLED:-false}"
+sec_q_alpha="${SEC_Q_ALPHA:-0.1}"
+sec_temperature="${SEC_TEMPERATURE:-1.0}"
+sec_refresh_interval="${SEC_REFRESH_INTERVAL:-50}"
+sec_refresh_rollouts="${SEC_REFRESH_ROLLOUTS:-$n}"
+sec_initial_stats="${SEC_INITIAL_CATEGORY_STATS:-null}"
+
+if [[ "$sec_enabled" == "true" && "$curriculum_enabled" == "true" ]]; then
+  echo "ERROR: SEC_ENABLED and CURRICULUM_ENABLED cannot both be true." >&2
+  exit 1
+fi
 
 if [[ -n "${GENERIC_COUNTERFACTUAL:-}" ]]; then
   generic_counterfactual="$GENERIC_COUNTERFACTUAL"
@@ -146,6 +160,12 @@ python3 -m verl.trainer.main_ppo \
     reward_model.lambda_cw=$lambda_cw \
     curriculum.enabled=$curriculum_enabled \
     curriculum.epsilon=$curriculum_epsilon \
+    sec.enabled=$sec_enabled \
+    sec.q_alpha=$sec_q_alpha \
+    sec.temperature=$sec_temperature \
+    sec.refresh_interval=$sec_refresh_interval \
+    sec.refresh_rollouts=$sec_refresh_rollouts \
+    sec.initial_category_stats_path=$sec_initial_stats \
     actor_rollout_ref.rollout.generic_counterfactual=$generic_counterfactual \
     actor_rollout_ref.rollout.include_generic_in_actor=False \
     critic.optim.lr=2e-6 \

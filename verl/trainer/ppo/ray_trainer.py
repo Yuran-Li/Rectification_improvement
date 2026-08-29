@@ -17,6 +17,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import os
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -48,7 +49,13 @@ from verl.utils.validation_utils import save_validation_results_to_json
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from verl.utils.dataset.curriculum_sampler import GenerationFrontierSampler
-from verl.utils.dataset.sec_sampler import SECSampler
+from verl.utils.dataset.sec_sampler import (
+    SECSampler,
+    aggregate_prompt_refresh_stats,
+    load_initial_category_stats,
+    prompt_ids_from_rlhf_dataset,
+    refresh_protocol_from_mapping,
+)
 
 WorkerType = Type[Worker]
 
@@ -492,36 +499,27 @@ class RayPPOTrainer(object):
         self.sec_sampler: Optional[SECSampler] = None
 
         if sec_cfg.get("enabled", False):
-            # Build per-level index maps from the training dataset.
-            # math_level is derived from the raw "level" column in the parquet
-            # (e.g. "Level 3"). It is NOT a stored column; use "level" directly.
-            level_col = self.train_dataset.dataframe["level"]  # list[str]
-            level_to_indices: dict = {lvl: [] for lvl in range(1, 6)}
-            for ds_idx, raw_level in enumerate(level_col):
-                if isinstance(raw_level, str) and raw_level.startswith("Level "):
-                    lvl_str = raw_level.split()[-1]
-                    lvl = int(lvl_str) if lvl_str.isdigit() else 3
-                else:
-                    lvl = 3
-                level_to_indices[lvl].append(ds_idx)
-
-            for lvl, idxs in level_to_indices.items():
-                print(f"[SEC] Level {lvl}: {len(idxs)} prompts")
+            prompt_ids = prompt_ids_from_rlhf_dataset(self.train_dataset)
+            print(f"[SEC] {len(prompt_ids)} prompts keyed by extra_info.index "
+                  f"(min={min(prompt_ids)}, max={max(prompt_ids)})")
 
             sec_log = sec_cfg.get("log_path") or os.path.join(
                 self.config.trainer.default_local_dir, "sec_q_log.jsonl"
             )
             self.sec_sampler = SECSampler(
-                level_to_indices=level_to_indices,
+                prompt_ids=prompt_ids,
                 q_alpha=float(sec_cfg.get("q_alpha", 0.1)),
                 temperature=float(sec_cfg.get("temperature", 1.0)),
                 seed=int(self.config.data.get("seed", 42)),
                 log_path=sec_log,
             )
+            self._sec_actor_updated_at = None
             # SEC bypasses StatefulDataLoader; use RandomSampler as placeholder
             sampler = RandomSampler(data_source=self.train_dataset)
             self.curriculum_sampler = None
-            print(f"[SEC] SECSampler enabled: α={self.sec_sampler.q_alpha}, τ={self.sec_sampler.temperature}, log={sec_log}")
+            print(f"[SEC] SECSampler enabled (dynamic C1–C5): α={self.sec_sampler.q_alpha}, "
+                  f"τ={self.sec_sampler.temperature}, "
+                  f"refresh_interval={sec_cfg.get('refresh_interval', 50)}, log={sec_log}")
 
         elif curriculum_cfg.get("enabled", False):
             # curriculum_cfg.get("log_path", default) returns None when key exists but is null.
@@ -874,6 +872,166 @@ class RayPPOTrainer(object):
         self.actor_rollout_wg = all_wg['actor_rollout']
         self.actor_rollout_wg.init_model()
 
+    def _sec_refresh_protocol(self) -> dict:
+        roll = self.config.actor_rollout_ref.rollout
+        sec_cfg = self.config.get("sec", {})
+        k_cfg = sec_cfg.get("refresh_rollouts")
+        k = int(roll.n) if k_cfg in (None, "null") else int(k_cfg)
+        if k != int(roll.n):
+            raise ValueError(
+                f"sec.refresh_rollouts={k} must equal actor_rollout_ref.rollout.n="
+                f"{int(roll.n)} so refresh uses the same PAG n as training."
+            )
+        return refresh_protocol_from_mapping({
+            "refresh_rollouts": k,
+            "model_path": str(self.config.actor_rollout_ref.model.path),
+            "rollout_type": str(roll.get("rollout_type", "pag")),
+            "num_turns": int(roll.num_turns),
+            "temperature": float(roll.get("temperature", 1.0)),
+            "top_k": int(roll.get("top_k", -1)),
+            "top_p": float(roll.get("top_p", 1.0)),
+            "revise_gate": str(roll.get("revise_gate", "pag")),
+            "do_sample": True,
+        })
+
+    def _ensure_sec_categories(self) -> dict:
+        """Before the first SEC batch: resume mapping, load protocol-matched stats, or refresh."""
+        if self.sec_sampler is None:
+            return {}
+        if self.sec_sampler.has_membership():
+            print(f"[SEC] categories already present "
+                  f"(last_refresh_step={self.sec_sampler.last_refresh_step})")
+            return {}
+        stats_path = self.config.sec.get("initial_category_stats_path")
+        if stats_path not in (None, "null", ""):
+            protocol = self._sec_refresh_protocol()
+            g_map, nwc_map = load_initial_category_stats(str(stats_path), protocol)
+            expected = set(int(x) for x in self.sec_sampler.prompt_ids.tolist())
+            missing = expected - set(g_map)
+            if missing:
+                raise ValueError(
+                    f"{stats_path} is missing {len(missing)} prompt ids "
+                    f"(e.g. {sorted(missing)[:5]})"
+                )
+            metrics = self.sec_sampler.replace_membership(g_map, nwc_map, step=0)
+            print(f"[SEC] loaded initial C1–C5 from {stats_path}")
+            return metrics
+        print("[SEC] no membership yet; running synchronized full-train refresh at step 0")
+        return self._sec_refresh(step=0)
+
+    def _sec_refresh(self, step: int) -> dict:
+        """Synchronized full-train PAG measurement of the current policy snapshot."""
+        if self.sec_sampler is None:
+            return {}
+        if step > 0 and self._sec_actor_updated_at != step:
+            raise RuntimeError(
+                f"SEC refresh at step={step} but actor was last updated at "
+                f"{self._sec_actor_updated_at}. Refresh must run after the PPO "
+                "update that produced the current snapshot."
+            )
+        protocol = self._sec_refresh_protocol()
+        k = int(protocol["refresh_rollouts"])
+        n_prompts = len(self.train_dataset)
+        chunk = int(self.config.data.get("gen_batch_size") or self.config.data.train_batch_size)
+        world = int(self.actor_rollout_wg.world_size)
+        t0 = time.perf_counter()
+
+        all_pids: list = []
+        all_acc1: list = []
+        all_acc2: list = []
+        all_rev: list = []
+        n_traj = 0
+        n_rect = 0
+        synced = False
+        fingerprint = None
+
+        roll = self.config.actor_rollout_ref.rollout
+        for start in range(0, n_prompts, chunk):
+            end = min(start + chunk, n_prompts)
+            items = [self.train_dataset[i] for i in range(start, end)]
+            batch = DataProto.from_single_dict(collate_fn(items))
+            n_unique = len(batch)
+            if 'multi_modal_inputs' in batch.non_tensor_batch.keys():
+                gen_batch = batch.pop(
+                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                    non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
+                )
+            else:
+                gen_batch = batch.pop(
+                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                    non_tensor_batch_keys=['raw_prompt_ids'],
+                )
+            gen_batch.meta_info.update({
+                'sec_category_refresh': True,
+                'do_sample': True,
+                'validate': False,
+                'num_turns': int(roll.num_turns),
+                'revise_gate': str(roll.get('revise_gate', 'pag')),
+            })
+            padded, pad_size = pad_dataproto_to_divisor(gen_batch, world)
+            out_padded = self.actor_rollout_wg.generate_sequences(padded)
+            if out_padded.meta_info.get('rollout_weights_synced'):
+                synced = True
+                fingerprint = out_padded.meta_info.get('rollout_weight_fingerprint')
+            # pad_size is extra *unique* prompts; generate_sequences then
+            # repeat_interleaves K, so drop pad_size * K trajectories at the end.
+            keep = n_unique * k
+            out = unpad_dataproto(out_padded, pad_size * k)
+            if len(out) != keep:
+                raise RuntimeError(
+                    f"SEC refresh expected {keep} trajectories, got {len(out)} "
+                    f"(n_unique={n_unique}, K={k}, pad_size={pad_size})"
+                )
+            batch = batch.repeat(repeat_times=k, interleave=True)
+            batch = batch.union(out)
+            result = self.reward_fn(batch, return_dict=True)
+            extra = result['reward_extra_info']
+            pids = np.asarray(batch.non_tensor_batch['index']).astype(np.int64).ravel()
+            acc1 = np.asarray(extra['acc_t1'], dtype=np.float64).ravel()
+            acc2 = np.asarray(extra['acc_t2'], dtype=np.float64).ravel()
+            rev = np.asarray(extra['revised'], dtype=bool).ravel()
+            all_pids.extend(int(x) for x in pids.tolist())
+            all_acc1.extend(float(x) for x in acc1.tolist())
+            all_acc2.extend(float(x) for x in acc2.tolist())
+            all_rev.extend(bool(x) for x in rev.tolist())
+            n_traj += int(pids.size)
+            n_rect += int(rev.sum())
+
+        if not synced:
+            raise RuntimeError(
+                "SEC refresh did not observe rollout_weights_synced after "
+                "generate_sequences. Refresh must run on the current actor "
+                "snapshot (FSDP→vLLM sync inside the sharding manager), not "
+                "stale rollout weights."
+            )
+
+        g_map, nwc_map = aggregate_prompt_refresh_stats(
+            all_pids, all_acc1, all_acc2, all_rev, k_refresh=k,
+        )
+        expected = set(int(x) for x in self.sec_sampler.prompt_ids.tolist())
+        got = set(g_map)
+        if got != expected:
+            raise RuntimeError(
+                f"SEC refresh coverage mismatch: missing={len(expected - got)} "
+                f"extra={len(got - expected)}"
+            )
+        mem_metrics = self.sec_sampler.replace_membership(g_map, nwc_map, step=step)
+        elapsed = time.perf_counter() - t0
+        mem_metrics['dynamic/refresh_wall_time_s'] = float(elapsed)
+        mem_metrics['dynamic/refresh_n_prompts'] = float(n_prompts)
+        mem_metrics['dynamic/refresh_n_trajectories'] = float(n_traj)
+        mem_metrics['dynamic/refresh_n_rectified'] = float(n_rect)
+        mem_metrics['dynamic/refresh_rollouts_K'] = float(k)
+        mem_metrics['dynamic/rollout_weights_synced'] = 1.0 if synced else 0.0
+        if fingerprint is not None:
+            mem_metrics['dynamic/rollout_weight_fingerprint'] = float(fingerprint)
+        print(
+            f"[SEC] refresh step={step} wall={elapsed:.1f}s "
+            f"prompts={n_prompts} traj={n_traj} rectified={n_rect} K={k} "
+            f"(wall-clock, not the ~rollout-workload fraction)"
+        )
+        return mem_metrics
+
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(self.config.trainer.default_local_dir,
@@ -1049,6 +1207,11 @@ class RayPPOTrainer(object):
             if self.config.trainer.get('val_only', False):
                 return
 
+        if self.sec_sampler is not None:
+            _init_sec = self._ensure_sec_categories()
+            if _init_sec:
+                logger.log(data=_init_sec, step=self.global_steps)
+
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
@@ -1079,6 +1242,8 @@ class RayPPOTrainer(object):
                     for _ in range(steps):
                         indices = sec_sampler.sample_batch(batch_size)
                         items = [dataset[int(i)] for i in indices]
+                        for item, idx in zip(items, indices):
+                            item['math_level'] = sec_sampler.category_of_row(int(idx))
                         yield _cfn(items)
                 _batch_source = _sec_batch_iter(
                     self.sec_sampler, self.train_dataset, _sec_batch_size, _sec_steps_per_epoch
@@ -1273,7 +1438,7 @@ class RayPPOTrainer(object):
                                     for _lvl in range(1, 6):
                                         _m = (_lvls_B == _lvl)
                                         if _m.any():
-                                            metrics[f'sec/A_{_turn_name}_level_{_lvl}'] = float(
+                                            metrics[f'sec/A_{_turn_name}_C{_lvl}'] = float(
                                                 _u_p[torch.tensor(_m)].mean().item())
 
                     # update critic
@@ -1290,6 +1455,8 @@ class RayPPOTrainer(object):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
+                        if self.sec_sampler is not None:
+                            self._sec_actor_updated_at = self.global_steps
 
                     # ── SEC: update Q_{t+1} AFTER the PAG optimizer step ────────
                     # Semantic: P_t → batch t → advantages → PAG update → Q_{t+1}
@@ -1302,15 +1469,25 @@ class RayPPOTrainer(object):
                                         batch.non_tensor_batch is not None else np.array([]))
                         sampled_lvls = sampled_lvls[::self.config.actor_rollout_ref.rollout.n]  # original prompts
                         for _lvl in range(1, 6):
-                            metrics[f'sec/Q_level_{_lvl}'] = float(_sec_stats['Q'][_lvl - 1])
-                            metrics[f'sec/P_level_{_lvl}'] = float(_sec_stats['P'][_lvl - 1])
-                            metrics[f'sec/reward_level_{_lvl}'] = float(_sec_r_per_level.get(_lvl, float('nan')))
-                            metrics[f'sec/batch_count_level_{_lvl}'] = int(
+                            metrics[f'sec/Q_C{_lvl}'] = float(_sec_stats['Q'][_lvl - 1])
+                            metrics[f'sec/P_C{_lvl}'] = float(_sec_stats['P'][_lvl - 1])
+                            metrics[f'sec/reward_C{_lvl}'] = float(_sec_r_per_level.get(_lvl, float('nan')))
+                            metrics[f'sec/batch_count_C{_lvl}'] = int(
                                 (sampled_lvls == _lvl).sum() if len(sampled_lvls) > 0 else 0)
-                            metrics[f'sec/cumulative_frac_level_{_lvl}'] = float(
+                            metrics[f'sec/cumulative_frac_C{_lvl}'] = float(
                                 _sec_stats['cumulative_counts'][_lvl - 1] / total_counts)
                         if len(sampled_lvls) > 0:
-                            metrics['sec/mean_sampled_level'] = float(sampled_lvls.mean())
+                            metrics['sec/mean_sampled_category'] = float(sampled_lvls.mean())
+
+                    # Synchronized C1–C5 refresh (measurement, not a uniform-training phase).
+                    if self.sec_sampler is not None:
+                        _interval = int(self.config.sec.get("refresh_interval", 50) or 50)
+                        if _interval > 0 and (
+                            is_last_step or
+                            (self.global_steps - int(self.sec_sampler.last_refresh_step)) >= _interval
+                        ):
+                            with _timer('sec_refresh', timing_raw):
+                                metrics.update(self._sec_refresh(step=self.global_steps))
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
