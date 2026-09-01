@@ -83,13 +83,11 @@ lambda_cw="${LAMBDA_CW:-0.2}"
 curriculum_enabled="${CURRICULUM_ENABLED:-false}"
 curriculum_epsilon="${CURRICULUM_EPSILON:-0.3}"
 
-# SEC (dynamic C1–C5). Off by default so this script stays a PAG baseline.
+# SEC (prevalence-aware C1–C5, U/C epochs). Off by default so this script stays a PAG baseline.
 sec_enabled="${SEC_ENABLED:-false}"
 sec_q_alpha="${SEC_Q_ALPHA:-0.1}"
-sec_temperature="${SEC_TEMPERATURE:-1.0}"
-sec_refresh_interval="${SEC_REFRESH_INTERVAL:-50}"
-sec_refresh_rollouts="${SEC_REFRESH_ROLLOUTS:-$n}"
-sec_initial_stats="${SEC_INITIAL_CATEGORY_STATS:-null}"
+sec_temperature="${SEC_TEMPERATURE:-0.1}"
+sec_prevalence_aware="${SEC_PREVALENCE_AWARE:-true}"
 
 if [[ "$sec_enabled" == "true" && "$curriculum_enabled" == "true" ]]; then
   echo "ERROR: SEC_ENABLED and CURRICULUM_ENABLED cannot both be true." >&2
@@ -163,9 +161,7 @@ python3 -m verl.trainer.main_ppo \
     sec.enabled=$sec_enabled \
     sec.q_alpha=$sec_q_alpha \
     sec.temperature=$sec_temperature \
-    sec.refresh_interval=$sec_refresh_interval \
-    sec.refresh_rollouts=$sec_refresh_rollouts \
-    sec.initial_category_stats_path=$sec_initial_stats \
+    sec.prevalence_aware=$sec_prevalence_aware \
     actor_rollout_ref.rollout.generic_counterfactual=$generic_counterfactual \
     actor_rollout_ref.rollout.include_generic_in_actor=False \
     critic.optim.lr=2e-6 \

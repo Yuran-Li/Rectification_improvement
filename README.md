@@ -8,7 +8,8 @@
 </div>
 
 ## News
-- **[2026/08/28]** Dynamic-category SEC: C1–C5 from synchronized $(g_t, n_{WC,t})$ refreshes (this branch). Q-update and sampling are unchanged from fixed MATH-level SEC.
+- **[2026/09/01]** Prevalence-aware SEC + U/C interleaving (this worktree): \(P(c)\propto |C_c|\exp(Q_c/\tau)\), τ=0.1, no extra measurement refresh. Replaces the 2026/08/28 refresh-interval design.
+- **[2026/08/28]** Dynamic-category SEC: C1–C5 from synchronized $(g_t, n_{WC,t})$ refreshes. Q-update and sampling were unchanged from fixed MATH-level SEC.
 - **[2026/08/27]** Self-Evolving Curriculum (SEC): online bandit sampler, per-slot multinomial category sampling, generation-advantage Q-update, full WandB diagnostics
 - **[2026/08/18]** Critique-informativeness PPO: split verifier rewards, same-`y0` generic counterfactual, pair logging (`P(CW)`, CER)
 - **[2025/06/27]** 🎉 Code released
@@ -149,11 +150,23 @@ Unit tests: `PYTHONPATH=. python tests/test_split_verify_reward.py` (PAG env).
 
 ## Self-Evolving Curriculum (SEC)
 
-An optional online curriculum sampler that replaces uniform prompt sampling with a dynamic C1–C5 bandit. SEC and the previous generation-frontier curriculum are **mutually exclusive**.
+An optional online curriculum sampler that replaces uniform prompt sampling with a dynamic C1–C5 bandit. SEC and the previous generation-frontier curriculum (`curriculum.enabled`) are **mutually exclusive**.
 
-### Design
+This worktree is a **controlled ablation** of the 2026/08/28 dynamic-SEC branch. Only three things change. PAG training, reward, PPO/GAE, C1–C5 thresholds, \(Q=Q^G\), and rollout `n=4` are unchanged.
 
-SEC maintains a Q-value per **dynamic** category C1–C5 and updates it after every PPO step using the generation-turn advantage as the reward signal. Category membership is **not** the parquet MATH level; it is assigned from a synchronized full-train PAG measurement of the current policy:
+### What changed vs the previous dynamic SEC
+
+| | Previous (`refresh_interval=50`) | This worktree |
+|--|--|--|
+| Category sampling | \(P(c)\propto \exp(Q_c/\tau)\) (small cats oversampled) | Switch: `sec.prevalence_aware=true` → \(P(c)\propto \|C_c\|\exp(Q_c/\tau)\); `false` → original softmax |
+| Membership refresh | Extra full-train measurement rollout every 50 PPO steps (and at step 0) | **Removed.** Measure while training in U |
+| Schedule | Always on the softmax curriculum | `U → C → U → C → …`, start with U |
+| Temperature | τ=1.0 | τ=0.1 (still configurable) |
+| ε-mix / g(1−g) / multi-role Q | none | still none |
+
+Do **not** pass `sec.refresh_interval`, `sec.refresh_rollouts`, or `SEC_INITIAL_CATEGORY_STATS`. Those keys are gone. Old refresh-interval checkpoints (no `phase` field) are refused.
+
+### Category definitions (unchanged)
 
 ```
 C1: g = 1
@@ -163,40 +176,81 @@ C4: g < 0.5,     n_WC > 0
 C5: g < 0.5,     n_WC = 0
 ```
 
-`g = n_correct_y0 / K_refresh` and `n_WC = #{y0 wrong and rectified y2 correct}`, using the same PAG `acc >= 0.5` criteria as training. Per-prompt state is keyed by `extra_info.index`.
+`g = n_correct_y0 / K` with training `K=4`, and `n_WC = #{y0 wrong and rectified y2 correct}` (existing PAG W→C). Per-prompt state is keyed by the stable `extra_info.index`, never filtered-row position.
+
+### 1. Prevalence-aware sampling (switch)
+
+`sec.prevalence_aware` (default `true`; env `SEC_PREVALENCE_AWARE`):
 
 ```
-Q_0(c) = 0  for all c
-P_t(c) = softmax(Q_t / τ)   # empty categories masked
+# on  (default):
+P(c) = |C_c| exp(Q_c / τ) / Σ_j |C_j| exp(Q_j / τ)
 
-for each batch of size B:
-    for each slot b = 1..B (i.i.d., with replacement):
-        c_b ~ Categorical(P_t)
-        prompt_b ~ Uniform(C_{c_b})   # with replacement
-
-    → normal PAG rollout + advantage computation
-    → r_t(c) = mean u_i^G over prompts i from category c
-    → Q_{t+1}(c) = (1-α) Q_t(c) + α r_t(c)   (absent categories unchanged)
-    → P_{t+1}
+# off:
+P(c) = exp(Q_c / τ) / Σ_j exp(Q_j / τ)     # empty cats masked in both cases
 ```
 
-Every `refresh_interval` PPO steps the trainer pauses for a **measurement** (not a uniform-training epoch): full-train PAG rollout of the current actor (FSDP weights synced into vLLM), then an atomic replace of `prompt_id → category`. Q is not reset.
+When **on**:
 
-`u_i^G` is the mean absolute generation-turn (`y0`) advantage over the K rollout trajectories of prompt `i`:
+- If all `Q_c` are equal, `P(c) = |C_c| / N` (prompt-uniform).
+- A small category is **not** oversampled merely because it is small.
+- A category is oversampled relative to its natural prevalence only when its Q is higher.
+- Equivalently each prompt has weight `w_i = exp(Q_{c(i)} / τ)`.
+
+When **off**: original category softmax. Equal Q ⇒ uniform over nonempty categories, so a small class still gets `1/n_nonempty` of the slots.
+
+Within a category (C phase): uniform with replacement. Empty categories are masked.
+
+Logged per step: `sec/prevalence_aware`, `sec/category_frac_C*`, `sec/category_prob_C*`, `sec/exposure_multiplier_C*` where `exposure_multiplier_c = P(c) / category_frac(c)`.
+
+### 2. U/C interleaved epochs (no extra measurement rollout)
+
+One U epoch and one C epoch each correspond to about one full training-set pass (`ceil(N/B)` PPO steps). Training starts with a **U** epoch so categories are measured from the current policy without a rollout-only refresh.
+
+**U phase** (uniform training + free state measurement):
+
+- Normal PPO; prompt-uniform, shuffled, **without replacement**; every train prompt once.
+- Existing training rollout `n=4`.
+- While training, collect per prompt: `prompt_id`, `g`, `n_WC`, generation utility `u_G`.
+- Membership stays **frozen** for attribution/logging for the whole U epoch.
+- At the **end** of the complete U epoch, atomically: rebuild `prompt_to_category` from the new `(g, n_WC)`; rebuild pools and prevalence; aggregate generation-only utility on the **new** categories; EMA-update Q.
+
+The last U batch may be padded (repeat indices) so `B * n` is divisible by the GPU world size. Padded prompts are **not** double-counted in U statistics.
+
+**C phase** (curriculum training):
+
+- Freeze the membership created at the end of the preceding U epoch.
+- Sample from the prevalence-aware distribution; normal PPO.
+- Batch-wise Q update using generation-only `|A_G|`.
+- Do **not** refresh membership during C.
+
+Then switch back to U.
+
+### 3. Temperature
+
+```yaml
+sec:
+  temperature: 0.1
+```
+
+Configurable, but this experiment uses 0.1. No extra ε/random mixing: U phases already give full prompt-uniform coverage.
+
+### Q semantics (unchanged)
 
 ```
-u_i^G = (1/K) Σ_k (1/T_ik^G) Σ_{t ∈ y0,ik} |A^G_{ik,t}|
+Q_c^G ← (1-α) Q_c^G + α r_c^G
 ```
 
-Only `A^G` (generation advantage) feeds the Q update. Verification and rectification advantages are logged per category for diagnostics only (`sec/A_verify_C*`, `sec/A_rectify_C*`).
+`r_c^G` is the existing mean generation `|A_G|` utility on `y0`. Do not fold `A_verify` or `A_rectify` into Q. Reward is unchanged.
 
-### Dynamic categories
+- **U-end:** one EMA from mean `u_G` of the newly assigned categories.
+- **C:** existing batch-wise EMA after each PPO step.
 
-There is no U→C→U→C schedule. SEC stays on. Refreshes are synchronized: every prompt is measured from the same policy snapshot. Precomputed `initial_category_stats_path` JSON must embed a `protocol` block matching this run (`refresh_rollouts` / model / sampling / PAG `revise_gate`). **Do not load K=8 dumps into a K=4 run.**
+### Checkpoint / resume
 
-### DataLoader bypass
+`sec_sampler.pt` restores exactly: `Q`, `cumulative_counts`, SEC step, current phase (`U` or `C`), position within the epoch, `prompt_to_category`, `g`, `n_WC`, category pools/prevalence, and RNG state. Resume continues the same U/C phase; it does not restart a U epoch or reset categories.
 
-Because `Q_{t+1}` must determine batch `t+1`, SEC bypasses `StatefulDataLoader` entirely when enabled. The trainer calls `sec_sampler.sample_batch(B)` to get indices, then fetches and collates items from `train_dataset` on the main process before dispatching to workers. No prefetching with stale Q-values.
+`total_training_steps` under SEC is `ceil(N/B) * total_epochs` so U can cover the prompts that a `drop_last` DataLoader would skip.
 
 ### Configuration
 
@@ -205,11 +259,9 @@ Because `Q_{t+1}` must determine batch `t+1`, SEC bypasses `StatefulDataLoader` 
 sec:
   enabled: false
   q_alpha: 0.1
-  temperature: 1.0
+  temperature: 0.1
+  prevalence_aware: true
   log_path: null
-  refresh_interval: 50
-  refresh_rollouts: 4          # must equal actor_rollout_ref.rollout.n
-  initial_category_stats_path: null
 ```
 
 `sec.enabled` and `curriculum.enabled` cannot both be `true` (assertion in trainer + shell guard).
@@ -218,10 +270,9 @@ sec:
 
 ```bash
 # SEC training (1.5B, 6 GPUs)
-SEC_ENABLED=true SEC_Q_ALPHA=0.1 SEC_TEMPERATURE=1.0 \
-  SEC_REFRESH_INTERVAL=50 SEC_REFRESH_ROLLOUTS=4 \
+SEC_ENABLED=true SEC_Q_ALPHA=0.1 SEC_TEMPERATURE=0.1 SEC_PREVALENCE_AWARE=true \
   FEEDBACK_MODE=delta CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
-  PROJECT_NAME="PAG-sec" EXPERIMENT_NAME="qwen1p5b_pag_sec_dynamic" \
+  PROJECT_NAME="PAG-sec" EXPERIMENT_NAME="qwen1p5b_pag_sec_prevalence_uc" \
   MODEL_PATH="Qwen/Qwen2.5-1.5B-Instruct" \
   bash quick_start/qwen1p5b_pag.sh \
     trainer.n_gpus_per_node=6 \
@@ -241,42 +292,45 @@ SEC_ENABLED=false CURRICULUM_ENABLED=false \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5
 ```
 
-Refresh wall-clock (`dynamic/refresh_wall_time_s`) and trajectory counts (`dynamic/refresh_n_trajectories`) are logged separately from training step time. The ~rollout-workload fraction at interval 50 is **not** the same as wall-clock overhead.
-
 ### WandB metrics logged per step
 
 | Metric | Description |
 |--------|-------------|
+| `sec/phase` | 0.0 = U, 1.0 = C |
+| `sec/prevalence_aware` | 1.0 if size-weighted P, else 0.0 |
+| `sec/epoch_index` | U/C epoch counter |
 | `sec/Q_C{1..5}` | Current Q-values |
-| `sec/P_C{1..5}` | Sampling probabilities |
+| `sec/category_prob_C{1..5}` / `sec/P_C{1..5}` | Sampling probabilities |
+| `sec/category_frac_C{1..5}` | Natural prevalence \|C_c\|/N |
+| `sec/exposure_multiplier_C{1..5}` | P(c) / category_frac(c) |
+| `sec/category_count_C{1..5}` | Pool sizes |
 | `sec/reward_C{1..5}` | `r_t(c)` used for Q update |
 | `sec/batch_count_C{1..5}` | Number of prompts per category in this batch |
 | `sec/cumulative_frac_C{1..5}` | Cumulative fraction of total prompts seen per category |
-| `sec/mean_sampled_category` | Mean category id in this batch |
 | `sec/A_generate_C{1..5}` | Mean absolute generation advantage per category |
 | `sec/A_verify_C{1..5}` | Mean absolute verification advantage (diagnostic) |
 | `sec/A_rectify_C{1..5}` | Mean absolute rectification advantage (diagnostic) |
 
-At each synchronized refresh: `dynamic/category_count_C*`, `dynamic/category_frac_C*`, `dynamic/g_mean_C*`, `dynamic/nWC_positive_frac_C*`, `dynamic/transition_Ci_to_Cj`, `dynamic/refresh_wall_time_s`, `dynamic/refresh_n_trajectories`.
+At each U-epoch end: 5×5 `sec/transition_Ci_to_Cj` (and `dynamic/transition_*`), especially C4→C1/C2/C4 and C5→C4/C2/C1.
 
 ### Unit tests
 
 ```bash
-PYTHONPATH=. python -m pytest tests/test_sec_sampler.py -v
+PYTHONPATH=. python -m pytest tests/sec_prevalence_uc_tests.py -v
 ```
 
-Tests cover: C1–C5 assignment, membership keyed by `extra_info.index` (not row position), migration after refresh, Q frozen across reassignment, empty-category mask, protocol-matched stats loading (K=8 dumps rejected on K=4), checkpoint restore of mapping+Q, generation-only `|A_G|`, and no U→C epoch switch.
+Tests cover: equal Q ⇒ `P(c)=|C_c|/N`; equal-size higher Q ⇒ higher P; per-example exposure ratio \(\exp((Q_i-Q_j)/\tau)\) independent of category size; empty-category mask; U visits every prompt once; membership frozen in U and replaced only at U-end; C uses the new membership; U→C→U→C and checkpoint resume.
 
 ### Key files
 
 | File | Role |
 |------|------|
-| `verl/utils/dataset/sec_sampler.py` | `SECSampler` (dynamic membership, sampling, Q update, checkpointing) |
-| `verl/trainer/ppo/ray_trainer.py` | Initial/periodic refresh, FSDP→vLLM sync, Q update, logging |
-| `verl/trainer/config/ppo_trainer.yaml` | `sec:` config block |
-| `quick_start/qwen1p5b_pag.sh` | `SEC_ENABLED`, `SEC_REFRESH_INTERVAL`, `SEC_REFRESH_ROLLOUTS` |
+| `verl/utils/dataset/sec_sampler.py` | Prevalence-aware `P(c)`, U/C epochs, membership rebuild, Q EMA, checkpoint |
+| `verl/trainer/ppo/ray_trainer.py` | U/C batch loop, U recording, no measurement refresh, logging |
+| `verl/trainer/config/ppo_trainer.yaml` | `sec.temperature: 0.1`, `sec.prevalence_aware`; no `refresh_interval` |
+| `quick_start/qwen1p5b_pag.sh` | `SEC_ENABLED`, `SEC_Q_ALPHA`, `SEC_TEMPERATURE` (default 0.1) |
 | `quick_start/run_pag_local.sh` | same `sec.*` hydra args (off by default) |
-| `tests/test_sec_sampler.py` | Unit tests |
+| `tests/sec_prevalence_uc_tests.py` | Deterministic prevalence / U/C / resume tests |
 
 ## Citation
 If you find this project helpful, please cite:

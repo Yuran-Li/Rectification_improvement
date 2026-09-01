@@ -9,8 +9,7 @@ curriculum:
   log_path: null      # JSONL path; null → <default_local_dir>/curriculum_competence.jsonl
 
 sec:
-  # SEC with dynamic C1–C5 (policy-dependent g, n_WC). Sampling / |A_G| Q-update
-  # match fixed-category SEC. Membership is replaced only at synchronized refreshes.
+  # Prevalence-aware SEC with U/C interleaved epochs (no extra measurement refresh).
   #
   #   C1: g=1
   #   C2: 0.5 ≤ g < 1, n_WC > 0
@@ -18,14 +17,18 @@ sec:
   #   C4: g < 0.5,     n_WC > 0
   #   C5: g < 0.5,     n_WC = 0
   #
+  #   prevalence_aware=true:  P(c) ∝ |C_c| exp(Q_c / τ)
+  #   prevalence_aware=false: P(c) ∝ exp(Q_c / τ)   (original softmax)
+  #   Q is generation-only |A_G|.
+  #   Training starts with a U epoch (prompt-uniform, one pass, n=4).
+  #   Membership is rebuilt only at the end of each U epoch.
+  #
   # sec.enabled and curriculum.enabled cannot both be True.
   enabled: false
   q_alpha: 0.1          # EMA learning rate for Q update
-  temperature: 1.0      # softmax temperature τ (higher → more uniform)
+  temperature: 0.1      # softmax temperature τ (this experiment)
+  prevalence_aware: true
   log_path: null        # JSONL path; null → <default_local_dir>/sec_q_log.jsonl
-  refresh_interval: 50  # PPO steps between full-train synchronized refreshes
-  refresh_rollouts: 4   # K_refresh; must equal actor_rollout_ref.rollout.n
-  initial_category_stats_path: null  # optional JSON; must match refresh protocol
 
 data:
   tokenizer: null
