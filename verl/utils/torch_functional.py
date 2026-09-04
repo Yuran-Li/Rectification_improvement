@@ -103,11 +103,26 @@ def clip_by_value(x, tensor_min, tensor_max):
     return clipped
 
 
-def entropy_from_logits(logits: torch.Tensor):
-    """Calculate entropy from logits."""
-    pd = torch.nn.functional.softmax(logits, dim=-1)
-    entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
-    return entropy
+def entropy_from_logits(logits: torch.Tensor, chunk_size: int = 2048):
+    """Calculate entropy from logits.
+
+    Softmax over vocab materializes a [T, V] tensor (fp32). For Qwen2.5,
+    T=16384 and V=151936 is 9.28 GiB — the exact allocation that OOMs
+    actor backward. Chunking along T is exact: entropy is tokenwise.
+    """
+    orig_shape = logits.shape[:-1]
+    logits_2d = logits.reshape(-1, logits.shape[-1])
+    n = logits_2d.shape[0]
+    if n <= chunk_size:
+        pd = torch.nn.functional.softmax(logits_2d, dim=-1)
+        entropy = torch.logsumexp(logits_2d, dim=-1) - torch.sum(pd * logits_2d, dim=-1)
+        return entropy.reshape(orig_shape)
+    chunks = []
+    for i in range(0, n, chunk_size):
+        sl = logits_2d[i:i + chunk_size]
+        pd = torch.nn.functional.softmax(sl, dim=-1)
+        chunks.append(torch.logsumexp(sl, dim=-1) - torch.sum(pd * sl, dim=-1))
+    return torch.cat(chunks, dim=0).reshape(orig_shape)
 
 
 def top_probs_from_logits(logits: torch.Tensor, k=3):

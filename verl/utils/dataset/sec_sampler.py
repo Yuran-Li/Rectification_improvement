@@ -604,6 +604,68 @@ class SECSampler:
 
         return r_per_level
 
+    @staticmethod
+    def compute_turn_absA_metrics(
+        advantages: "torch.Tensor",
+        turn_idx: "torch.Tensor",
+        mt_mask: "torch.Tensor",
+        levels_BK: np.ndarray,
+        num_repeat: int,
+    ) -> Dict[str, float]:
+        """Per-category |A| diagnostics for generate / verify / rectify.
+
+        ``sec/A_{role}_C*`` is the historical *unconditional* mean: trajectories
+        with no tokens on that turn contribute 0 (``clamp(min=1)`` on length).
+        For a category C that is equivalent to
+
+            E[u^r | C] = P(has turn r | C) · E[|A_r| | has turn r, C].
+
+        Rectify additionally logs the two factors separately (trajectory-level):
+
+            sec/rectify_trigger_rate_C*     = P(has y2 | C)
+            sec/A_rectify_conditional_C*    = E[mean_t |A| | has y2, C]
+        """
+        import torch
+
+        out: Dict[str, float] = {}
+        levels = np.asarray(levels_BK, dtype=np.int32)
+        n = int(num_repeat)
+        if advantages.size(0) % n != 0:
+            raise ValueError("B*K must be divisible by K")
+        if levels.shape[0] != advantages.size(0):
+            raise ValueError(
+                f"levels_BK length {levels.shape[0]} != B*K {advantages.size(0)}"
+            )
+
+        for turn_num, turn_name in [(1, "generate"), (2, "verify"), (3, "rectify")]:
+            tmask = (turn_idx == turn_num) & mt_mask
+            t_len = tmask.float().sum(dim=1)  # (B*K,)
+            has_turn = t_len > 0
+            u_t = (advantages.abs() * tmask.float()).sum(dim=1) / t_len.clamp(min=1.0)
+            u_p = u_t.view(-1, n).mean(dim=1)
+            levels_B = levels[::n]
+            has_np = has_turn.detach().cpu().numpy()
+            u_t_np = u_t.detach().cpu().numpy()
+
+            for lvl in _VALID_LEVELS:
+                m_prompt = levels_B == lvl
+                if m_prompt.any():
+                    out[f"sec/A_{turn_name}_C{lvl}"] = float(
+                        u_p[torch.as_tensor(m_prompt, device=u_p.device)].mean().item()
+                    )
+                if turn_name != "rectify":
+                    continue
+                m_traj = levels == lvl
+                if not m_traj.any():
+                    continue
+                out[f"sec/rectify_trigger_rate_C{lvl}"] = float(has_np[m_traj].mean())
+                cond = m_traj & has_np
+                if cond.any():
+                    out[f"sec/A_rectify_conditional_C{lvl}"] = float(u_t_np[cond].mean())
+                else:
+                    out[f"sec/A_rectify_conditional_C{lvl}"] = float("nan")
+        return out
+
 
 def _dummy_stats_for_category(cat: int) -> Tuple[float, int]:
     """Invert C1–C5 to a legal (g, n_WC) pair for test bootstrap only."""

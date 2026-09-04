@@ -113,11 +113,19 @@ class DataParallelPPOActor(BasePPOActor):
                                            **multi_modal_inputs,
                                            use_cache=False)  # prevent model thinks we are generating
                 logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                del output
 
                 logits_rmpad.div_(temperature)
 
-                # compute entropy
-                entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+                # entropy_coeff=0 (PAG default): entropy is logging-only and must
+                # not stay in the autograd graph. Softmax(logits) is [T, vocab]
+                # fp32; T=16384 → 9.28 GiB, which is the actor-backward OOM.
+                entropy_coeff = self.config.get('entropy_coeff', 0) or 0
+                if float(entropy_coeff) == 0.0:
+                    with torch.no_grad():
+                        entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
+                else:
+                    entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
 
                 # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                 log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
@@ -152,10 +160,16 @@ class DataParallelPPOActor(BasePPOActor):
                                            **multi_modal_inputs,
                                            use_cache=False)  # prevent model thinks we are generating
                 logits = output.logits
+                del output
                 logits.div_(temperature)
                 logits = logits[:, -response_length - 1:-1, :]  # (bsz, response_length, vocab_size)
                 log_probs = logprobs_from_logits(logits, micro_batch['responses'])
-                entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                entropy_coeff = self.config.get('entropy_coeff', 0) or 0
+                if float(entropy_coeff) == 0.0:
+                    with torch.no_grad():
+                        entropy = verl_F.entropy_from_logits(logits)
+                else:
+                    entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
             return entropy, log_probs
 
@@ -309,7 +323,10 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy_loss = agg_loss(loss_mat=entropy, loss_mask=multiturn_mask, loss_agg_mode=loss_agg_mode)
 
                     # compute policy loss
-                    policy_loss = pg_loss - entropy_loss * entropy_coeff
+                    if entropy_coeff:
+                        policy_loss = pg_loss - entropy_loss * entropy_coeff
+                    else:
+                        policy_loss = pg_loss
 
                     if self.config.use_kl_loss:
                         ref_log_prob = data['ref_log_prob']
@@ -330,6 +347,12 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
+                    # Release PyTorch's cached-but-unallocated memory back to CUDA
+                    # before backward. vLLM's CuMemAllocator holds GPU physical pages
+                    # in its own pool even after free_cache_engine, leaving the PyTorch
+                    # cache fragmented. Without this, a large contiguous backward
+                    # allocation (e.g. 16 GiB) can OOM even when total free > needed.
+                    torch.cuda.empty_cache()
                     loss.backward()
 
                     data = {

@@ -1427,19 +1427,19 @@ class RayPPOTrainer(object):
                                     num_repeat=self.config.actor_rollout_ref.rollout.n,
                                 )
 
-                            # Diagnostic: log |A| per level for all three turns
-                            for _turn_num, _turn_name in [(1, 'generate'), (2, 'verify'), (3, 'rectify')]:
-                                _tmask = (_turn_idx == _turn_num) & _mt_mask
-                                _t_len = _tmask.float().sum(dim=1).clamp(min=1.)
-                                _u_t   = (_adv.abs() * _tmask.float()).sum(dim=1) / _t_len  # (B*K,)
-                                _u_p   = _u_t.view(-1, self.config.actor_rollout_ref.rollout.n).mean(1)  # (B,)
-                                _lvls_B = _levels_BK[::self.config.actor_rollout_ref.rollout.n] if _levels_BK is not None else None
-                                if _lvls_B is not None:
-                                    for _lvl in range(1, 6):
-                                        _m = (_lvls_B == _lvl)
-                                        if _m.any():
-                                            metrics[f'sec/A_{_turn_name}_C{_lvl}'] = float(
-                                                _u_p[torch.tensor(_m)].mean().item())
+                            # Diagnostic: |A| per role. Unconditional A_rectify_C*
+                            # 0-fills trajectories with no y2; also log P(revise|C)
+                            # and E[|A_R| | revise, C] so frequency ≠ intensity.
+                            if _levels_BK is not None:
+                                metrics.update(
+                                    SECSampler.compute_turn_absA_metrics(
+                                        advantages=_adv,
+                                        turn_idx=_turn_idx,
+                                        mt_mask=_mt_mask,
+                                        levels_BK=_levels_BK,
+                                        num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                    )
+                                )
 
                     # update critic
                     if self.use_critic:
