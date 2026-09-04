@@ -52,6 +52,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from verl.utils.dataset.curriculum_sampler import GenerationFrontierSampler
 from verl.utils.dataset.sec_sampler import (
     SECSampler,
+    pad_indices_to_divisor,
     prompt_ids_from_rlhf_dataset,
 )
 
@@ -884,18 +885,12 @@ class RayPPOTrainer(object):
         self.actor_rollout_wg.init_model()
 
     def _sec_pad_indices(self, indices: np.ndarray) -> np.ndarray:
-        """Pad a short U last-batch so B * rollout.n is divisible by world size."""
-        world = int(self.actor_rollout_wg.world_size)
-        k = int(self.config.actor_rollout_ref.rollout.n)
-        b = int(indices.size)
-        if b == 0 or world <= 0:
-            return indices
-        need = world // math.gcd(world, k)
-        if b % need == 0:
-            return indices
-        extra = need - (b % need)
-        pad = np.resize(indices, extra)
-        return np.concatenate([indices, pad])
+        """Pad a short U last-batch so the prompt batch is divisible by DP world size.
+
+        generate_sequences chunks DataProto of size B (not B*n). 8 GPU + n=4
+        used to only require even B, which left 326 unpadded and crashed.
+        """
+        return pad_indices_to_divisor(indices, int(self.actor_rollout_wg.world_size))
 
     def _sec_epoch_batches(self, batch_size: int):
         """Yield one U or C epoch of collated batches. Stops when that epoch is complete."""
@@ -1158,6 +1153,10 @@ class RayPPOTrainer(object):
                 with _timer('step', timing_raw):
                     # generate a batch
                     with _timer('gen', timing_raw):
+                        _dp = int(self.actor_rollout_wg.world_size)
+                        gen_batch, _gen_pad = pad_dataproto_to_divisor(gen_batch, _dp)
+                        if _gen_pad:
+                            batch, _ = pad_dataproto_to_divisor(batch, _dp)
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:

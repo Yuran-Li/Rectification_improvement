@@ -61,6 +61,21 @@ def assign_category(g: float, n_wc: int) -> int:
     return 4 if n > 0 else 5
 
 
+def pad_indices_to_divisor(indices: np.ndarray, divisor: int) -> np.ndarray:
+    """Repeat-pad row indices so ``len % divisor == 0``.
+
+    ``generate_sequences`` chunks the *prompt* batch by DP world size, so the
+    last U batch must be padded to ``world_size``, not to ``world_size / gcd(world, n)``.
+    """
+    idx = np.asarray(indices)
+    b = int(idx.size)
+    d = int(divisor)
+    if b == 0 or d <= 0 or b % d == 0:
+        return idx
+    extra = d - (b % d)
+    return np.concatenate([idx, np.resize(idx, extra)])
+
+
 def refresh_protocol_from_mapping(protocol: Mapping[str, Any]) -> Dict[str, Any]:
     """Normalize a protocol dict to comparable JSON-friendly scalars."""
     out: Dict[str, Any] = {}
