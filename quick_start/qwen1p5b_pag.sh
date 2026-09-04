@@ -11,8 +11,24 @@ PROJECT_NAME="${PROJECT_NAME:-PAG}"
 CKPT_PATH="${CKPT_PATH:-checkpoints}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}"
 
+# 1.5B → MATH 7.5k; 7B → DAPO 17k. Override with TRAIN_DATASET=/path/to.parquet
+_model_lc="$(printf '%s' "$MODEL_PATH" | tr '[:upper:]' '[:lower:]')"
+if [[ -n "${TRAIN_DATASET:-}" ]]; then
+  training_dataset="$TRAIN_DATASET"
+elif [[ "$_model_lc" =~ (^|[^0-9])7b([^0-9]|$) ]]; then
+  training_dataset="$dapo17k"
+elif [[ "$_model_lc" =~ (^|[^0-9])1\.5b([^0-9]|$) ]]; then
+  training_dataset="$math7500"
+else
+  echo "Cannot infer train set from MODEL_PATH=$MODEL_PATH (expected 1.5B or 7B). Set TRAIN_DATASET." >&2
+  exit 1
+fi
+echo "[qwen1p5b_pag] MODEL_PATH=$MODEL_PATH  training_dataset=$training_dataset"
+
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen1p5b_pag}"
-n=4
+# Train-time group size. Override with N_ROLLOUTS (or SEC_REFRESH_ROLLOUTS).
+# SEC refresh K must equal this; default both to 8.
+n="${N_ROLLOUTS:-${SEC_REFRESH_ROLLOUTS:-8}}"
 rollout_type=pag
 num_turns=2
 policy_rs=True
@@ -60,6 +76,10 @@ if [[ "$sec_enabled" == "true" && "$curriculum_enabled" == "true" ]]; then
   echo "ERROR: SEC_ENABLED and CURRICULUM_ENABLED cannot both be true." >&2
   exit 1
 fi
+if [[ "$sec_enabled" == "true" && "$sec_refresh_rollouts" != "$n" ]]; then
+  echo "ERROR: SEC_REFRESH_ROLLOUTS (${sec_refresh_rollouts}) must equal N_ROLLOUTS/n (${n})." >&2
+  exit 1
+fi
 
 if [[ -n "${GENERIC_COUNTERFACTUAL:-}" ]]; then
   generic_counterfactual="$GENERIC_COUNTERFACTUAL"
@@ -71,7 +91,7 @@ fi
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=gae \
-    data.train_files=[$math7500] \
+    data.train_files=[$training_dataset] \
     data.val_files="['$math500']" \
     data.filter_overlong_prompts=True \
     data.train_batch_size=512 \
